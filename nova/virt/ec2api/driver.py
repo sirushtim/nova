@@ -37,7 +37,7 @@ from nova.virt import firewall
 import boto.ec2
 import simplejson as json
 from pprint import pprint
-
+import time
 driver_opts = [
     cfg.StrOpt('ec2API',default='boto',
                help='Driver to use for controlling virtualization. Options '
@@ -250,10 +250,13 @@ class EC2Driver(driver.ComputeDriver):
         import ipdb; ipdb.set_trace()
         nw_info = json.loads(network_info.json())
         private_address = nw_info[0]['network']['subnets'][0]['ips'][0]['address']
-        reservation = self.conn.run_instances('ami-aa198ac3',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-1de45b71',user_data=instance['uuid'])
-        publicInstance = reservation.instances[0]        
-        while(publicInstance.update()=='pending'):
-            continue
+        reservation = self.conn.run_instances('ami-aa198ac3',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-1de45b71',user_data = instance['user_data'])
+        public_instance = reservation.instances[0]        
+        while(public_instance.update()!='running'):
+            time.sleep(10)
+	
+	if public_instance.update() == 'running':
+	    public_instance.add_tag("uuid",instance['uuid'])
         #nw_info = json.loads(network_info.json())
         #nw_info[0]['network']['subnets'][0]['ips'][0]['address'] = publicInstance.ip_address
         #nw_info=json.dumps(nw_info)
@@ -289,8 +292,8 @@ class EC2Driver(driver.ComputeDriver):
 	    'Do Nothing'
         # TODO(Vek): Need to pass context in for access to auth_token
 
-    #Make it Protected    
-    def get_public_instance(self,instance):
+    #Deprecated
+    def get_public_instance_by_user_data(self,instance):
         reservations = self.conn.get_all_instances()
         instances = [i for r in reservations for i in r.instances]
         corresponding_public_instance = {}
@@ -299,6 +302,15 @@ class EC2Driver(driver.ComputeDriver):
             if public_uuid != None:
                 if public_uuid.decode('base64')==instance['uuid']:
                     return public_instance
+
+    def get_public_instance(self,instance):
+	reservations = self.conn.get_all_instances()
+	instances = [i for r in reservations for i in r.instances] 
+	for public_instance in instances:
+	    if public_instance.tags.has_key("uuid"):
+		public_uuid = public_instance.tags["uuid"]
+		if public_uuid == instance['uuid']:
+		    return public_instance	
 
     def reboot(self, context, instance, network_info, reboot_type,
                block_device_info=None):
