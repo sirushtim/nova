@@ -38,6 +38,8 @@ import boto.ec2
 import simplejson as json
 from pprint import pprint
 import time
+import base64
+
 driver_opts = [
     cfg.StrOpt('ec2API',default='boto',
                help='Driver to use for controlling virtualization. Options '
@@ -249,14 +251,18 @@ class EC2Driver(driver.ComputeDriver):
         """
         import ipdb; ipdb.set_trace()
         nw_info = json.loads(network_info.json())
+	elastic_ip = self.conn.allocate_address(domain='vpc')
         private_address = nw_info[0]['network']['subnets'][0]['ips'][0]['address']
-        reservation = self.conn.run_instances('ami-aa198ac3',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-1de45b71',user_data = instance['user_data'])
+        reservation = self.conn.run_instances('ami-3dadcf54',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-1de45b71',user_data = base64.b64decode(instance['user_data']))
         public_instance = reservation.instances[0]        
         while(public_instance.update()!='running'):
             time.sleep(10)
 	
 	if public_instance.update() == 'running':
 	    public_instance.add_tag("uuid",instance['uuid'])
+
+	self.conn.associate_address(instance_id = public_instance.id, allocation_id = elastic_ip.allocation_id)
+
         #nw_info = json.loads(network_info.json())
         #nw_info[0]['network']['subnets'][0]['ips'][0]['address'] = publicInstance.ip_address
         #nw_info=json.dumps(nw_info)
@@ -285,12 +291,16 @@ class EC2Driver(driver.ComputeDriver):
 
         """
         import ipdb; ipdb.set_trace()
-        public_instance = self.get_public_instance(instance)
         try:
-	    self.conn.terminate_instances([public_instance.id])
+	    public_instance = self.get_public_instance(instance)
+	    elastic_ip = self.conn.get_all_addresses(addresses = [public_instance.ip_address])[0]
+	    if(self.conn.disassociate_address(association_id = elastic_ip.association_id)==True):
+	        elastic_ip.delete()
+	        self.conn.terminate_instances([public_instance.id])
         except AttributeError:
-	    'Do Nothing'
-        # TODO(Vek): Need to pass context in for access to auth_token
+	    print 'Bug Fix Needed'
+
+	# TODO(Vek): Need to pass context in for access to auth_token
 
     #Deprecated
     def get_public_instance_by_user_data(self,instance):
