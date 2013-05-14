@@ -253,7 +253,10 @@ class EC2Driver(driver.ComputeDriver):
         nw_info = json.loads(network_info.json())
 	elastic_ip = self.conn.allocate_address(domain='vpc')
         private_address = nw_info[0]['network']['subnets'][0]['ips'][0]['address']
-        reservation = self.conn.run_instances('ami-3dadcf54',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-1de45b71',user_data = base64.b64decode(instance['user_data']))
+	if instance['user_data'] is not None:
+	    reservation = self.conn.run_instances('ami-3dadcf54',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-1de45b71',user_data = base64.b64decode(instance['user_data']))
+	else:
+	    reservation = self.conn.run_instances('ami-3dadcf54',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-1de45b71')
         public_instance = reservation.instances[0]        
         while(public_instance.update()!='running'):
             time.sleep(10)
