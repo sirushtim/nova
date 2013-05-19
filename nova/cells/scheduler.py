@@ -103,8 +103,7 @@ class CellsScheduler(base.Base):
         random.shuffle(cells)
         target_cell = cells[0]
 
-        LOG.debug(_("Scheduling with routing_path=%(routing_path)s"),
-                locals())
+        #LOG.debug(_("Scheduling with routing_path=%(routing_path)s"), locals())
 
         if target_cell.is_me:
             # Need to create instance DB entries as the host scheduler
