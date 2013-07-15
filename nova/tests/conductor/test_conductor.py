@@ -266,30 +266,6 @@ class _BaseTestCase(object):
         result = self.conductor.bw_usage_update(*update_args)
         self.assertEqual(result, 'foo')
 
-    def test_get_backdoor_port(self):
-        backdoor_port = 59697
-
-        def fake_get_backdoor_port(self, context):
-            return backdoor_port
-
-        if isinstance(self.conductor, conductor_api.API):
-            self.stubs.Set(conductor_manager.ConductorManager,
-                          'get_backdoor_port', fake_get_backdoor_port)
-            port = self.conductor.get_backdoor_port(self.context, 'fake_host')
-        elif isinstance(self.conductor, conductor_api.LocalAPI):
-            try:
-                self.conductor.get_backdoor_port(self.context, 'fake_host')
-            except exc.InvalidRequest:
-                port = backdoor_port
-        else:
-            if isinstance(self.conductor, conductor_rpcapi.ConductorAPI):
-                self.stubs.Set(conductor_manager.ConductorManager,
-                              'get_backdoor_port', fake_get_backdoor_port)
-            self.conductor.backdoor_port = backdoor_port
-            port = self.conductor.get_backdoor_port(self.context)
-
-        self.assertEqual(port, backdoor_port)
-
     def test_security_group_get_by_instance(self):
         fake_instance = {'id': 'fake-instance'}
         self.mox.StubOutWithMock(db, 'security_group_get_by_instance')
@@ -409,10 +385,6 @@ class _BaseTestCase(object):
                                          'project_id': 'fake-project_id',
                                          'user_id': 'fake-user_id'},
                                         'fake-refr', 'fake-bool')
-
-    def test_ping(self):
-        result = self.conductor.ping(self.context, 'foo')
-        self.assertEqual(result, {'service': 'conductor', 'arg': 'foo'})
 
     def test_compute_node_create(self):
         self.mox.StubOutWithMock(db, 'compute_node_create')
@@ -1073,17 +1045,17 @@ class ConductorAPITestCase(_BaseTestCase, test.TestCase):
                                                          'host')
         self.assertEqual(result, 'fake-result')
 
-    def test_ping(self):
+    def test_wait_until_ready(self):
         timeouts = []
         calls = dict(count=0)
 
-        def fake_ping(_self, context, message, timeout):
+        def fake_ping(context, message, timeout):
             timeouts.append(timeout)
             calls['count'] += 1
             if calls['count'] < 15:
                 raise rpc_common.Timeout("fake")
 
-        self.stubs.Set(conductor_api.API, 'ping', fake_ping)
+        self.stubs.Set(self.conductor.base_rpcapi, 'ping', fake_ping)
 
         self.conductor.wait_until_ready(self.context)
 
@@ -1117,7 +1089,7 @@ class ConductorLocalAPITestCase(ConductorAPITestCase):
         self.assertRaises(KeyError,
                           self._do_update, instance['uuid'], foo='bar')
 
-    def test_ping(self):
+    def test_wait_until_ready(self):
         # Override test in ConductorAPITestCase
         pass
 

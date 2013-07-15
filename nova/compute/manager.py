@@ -650,6 +650,8 @@ class ComputeManager(manager.SchedulerDependentManager):
         except exception.NotFound:
             return power_state.NOSTATE
 
+    # NOTE(russellb) This method can be removed in 3.0 of this API.  It is
+    # deprecated in favor of the method in the base API.
     def get_backdoor_port(self, context):
         """Return backdoor port for eventlet_backdoor."""
         return self.backdoor_port
@@ -834,6 +836,62 @@ class ComputeManager(manager.SchedulerDependentManager):
                       filter_properties, requested_networks, injected_files,
                       admin_password, is_first_time, node, instance):
         """Launch a new instance with specified options."""
+
+        extra_usage_info = {}
+
+        def notify(status, msg=None):
+            """Send a create.{start,error,end} notification."""
+            type_ = "create.%(status)s" % dict(status=status)
+            info = extra_usage_info.copy()
+            if not msg:
+                msg = ""
+            info['message'] = msg
+            self._notify_about_instance_usage(context, instance, type_,
+                    extra_usage_info=info)
+
+        try:
+            image_meta = self._prebuild_instance(context, instance)
+            if image_meta:
+                extra_usage_info = {"image_name": image_meta['name']}
+
+            notify("start")  # notify that build is starting
+
+            instance = self._build_instance(context, request_spec,
+                    filter_properties, requested_networks, injected_files,
+                    admin_password, is_first_time, node, instance, image_meta)
+            notify("end", msg=_("Success"))  # notify that build is done
+
+        except exception.RescheduledException as e:
+            # Instance build encountered an error, and has been rescheduled.
+            notify("error", msg=unicode(e))  # notify that build failed
+
+        except exception.BuildAbortException as e:
+            # Instance build aborted due to a non-failure
+            LOG.info(e)
+            notify("end", msg=unicode(e))  # notify that build is done
+
+        except Exception as e:
+            # Instance build encountered a non-recoverable error:
+            with excutils.save_and_reraise_exception():
+                self._set_instance_error_state(context, instance['uuid'])
+                notify("error", msg=unicode(e))  # notify that build failed
+
+    def _prebuild_instance(self, context, instance):
+        self._check_instance_exists(context, instance)
+
+        try:
+            self._start_building(context, instance)
+        except exception.InstanceNotFound:
+            msg = _("Instance disappeared before we could start it")
+            # Quickly bail out of here
+            raise exception.BuildAbortException(instance_uuid=instance['uuid'],
+                    reason=msg)
+
+        return self._check_image_size(context, instance)
+
+    def _build_instance(self, context, request_spec, filter_properties,
+            requested_networks, injected_files, admin_password, is_first_time,
+            node, instance, image_meta):
         context = context.elevated()
 
         # If quantum security groups pass requested security
@@ -843,97 +901,81 @@ class ComputeManager(manager.SchedulerDependentManager):
         else:
             security_groups = []
 
+        if node is None:
+            node = self.driver.get_available_nodes()[0]
+            LOG.debug(_("No node specified, defaulting to %(node)s") %
+                      locals())
+
+        network_info = None
+        bdms = self.conductor_api.block_device_mapping_get_all_by_instance(
+            context, instance)
+
+        # b64 decode the files to inject:
+        injected_files_orig = injected_files
+        injected_files = self._decode_files(injected_files)
+
+        rt = self._get_resource_tracker(node)
         try:
-            self._check_instance_exists(context, instance)
+            limits = filter_properties.get('limits', {})
+            with rt.instance_claim(context, instance, limits):
+                macs = self.driver.macs_for_instance(instance)
 
-            try:
-                self._start_building(context, instance)
-            except exception.InstanceNotFound:
-                LOG.info(_("Instance disappeared before we could start it"),
-                         instance=instance)
-                # Quickly bail out of here
-                return
+                network_info = self._allocate_network(context, instance,
+                        requested_networks, macs, security_groups)
 
-            image_meta = self._check_image_size(context, instance)
+                self._instance_update(
+                        context, instance['uuid'],
+                        vm_state=vm_states.BUILDING,
+                        task_state=task_states.BLOCK_DEVICE_MAPPING)
 
-            if node is None:
-                node = self.driver.get_available_nodes()[0]
-                LOG.debug(_("No node specified, defaulting to %(node)s") %
-                          locals())
+                block_device_info = self._prep_block_device(
+                        context, instance, bdms)
 
-            if image_meta:
-                extra_usage_info = {"image_name": image_meta['name']}
-            else:
-                extra_usage_info = {}
+                set_access_ip = (is_first_time and
+                                 not instance['access_ip_v4'] and
+                                 not instance['access_ip_v6'])
 
-            self._notify_about_instance_usage(
-                    context, instance, "create.start",
-                    extra_usage_info=extra_usage_info)
-
-            network_info = None
-            bdms = self.conductor_api.block_device_mapping_get_all_by_instance(
-                context, instance)
-
-            # b64 decode the files to inject:
-            injected_files_orig = injected_files
-            injected_files = self._decode_files(injected_files)
-
-            rt = self._get_resource_tracker(node)
-            try:
-                limits = filter_properties.get('limits', {})
-                with rt.instance_claim(context, instance, limits):
-                    macs = self.driver.macs_for_instance(instance)
-
-                    network_info = self._allocate_network(context, instance,
-                            requested_networks, macs, security_groups)
-
-                    self._instance_update(
-                            context, instance['uuid'],
-                            vm_state=vm_states.BUILDING,
-                            task_state=task_states.BLOCK_DEVICE_MAPPING)
-
-                    block_device_info = self._prep_block_device(
-                            context, instance, bdms)
-
-                    set_access_ip = (is_first_time and
-                                     not instance['access_ip_v4'] and
-                                     not instance['access_ip_v6'])
-
-                    instance = self._spawn(context, instance, image_meta,
-                                           network_info, block_device_info,
-                                           injected_files, admin_password,
-                                           set_access_ip=set_access_ip)
-            except exception.InstanceNotFound:
-                # the instance got deleted during the spawn
-                with excutils.save_and_reraise_exception():
-                    try:
-                        self._deallocate_network(context, instance)
-                    except Exception:
-                        msg = _('Failed to dealloc network '
-                                'for deleted instance')
-                        LOG.exception(msg, instance=instance)
-            except exception.UnexpectedTaskStateError as e:
-                actual_task_state = e.kwargs.get('actual', None)
-                if actual_task_state == 'deleting':
-                    msg = _('Instance was deleted during spawn.')
-                    LOG.debug(msg, instance=instance)
-                else:
-                    raise
-            except Exception:
-                exc_info = sys.exc_info()
-                # try to re-schedule instance:
-                self._reschedule_or_reraise(context, instance, exc_info,
-                        requested_networks, admin_password,
-                        injected_files_orig, is_first_time, request_spec,
-                        filter_properties, bdms)
-            else:
-                # Spawn success:
-                self._notify_about_instance_usage(context, instance,
-                        "create.end", network_info=network_info,
-                        extra_usage_info=extra_usage_info)
-        except Exception:
+                instance = self._spawn(context, instance, image_meta,
+                                       network_info, block_device_info,
+                                       injected_files, admin_password,
+                                       set_access_ip=set_access_ip)
+        except exception.InstanceNotFound:
+            # the instance got deleted during the spawn
             with excutils.save_and_reraise_exception():
-                self._set_instance_error_state(context, instance['uuid'])
+                try:
+                    self._deallocate_network(context, instance)
+                except Exception:
+                    msg = _('Failed to dealloc network '
+                            'for deleted instance')
+                    LOG.exception(msg, instance=instance)
+        except exception.UnexpectedTaskStateError as e:
+            actual_task_state = e.kwargs.get('actual', None)
+            if actual_task_state == 'deleting':
+                msg = _('Instance was deleted during spawn.')
+                LOG.debug(msg, instance=instance)
+                raise exception.BuildAbortException(
+                        instance_uuid=instance['uuid'], reason=msg)
+            else:
+                raise
+        except Exception:
+            exc_info = sys.exc_info()
+            # try to re-schedule instance:
+            rescheduled = self._reschedule_or_error(context, instance,
+                    exc_info, requested_networks, admin_password,
+                    injected_files_orig, is_first_time, request_spec,
+                    filter_properties, bdms)
+            if rescheduled:
+                # log the original build error
+                self._log_original_error(exc_info, instance['uuid'])
+                raise exception.RescheduledException(
+                        instance_uuid=instance['uuid'],
+                        reason=unicode(exc_info[1]))
+            else:
+                # not re-scheduling, go to error:
+                raise exc_info[0], exc_info[1], exc_info[2]
+
+        # spawn success
+        return instance
 
     def _log_original_error(self, exc_info, instance_uuid):
         type_, value, tb = exc_info
@@ -941,7 +983,7 @@ class ComputeManager(manager.SchedulerDependentManager):
                   traceback.format_exception(type_, value, tb),
                   instance_uuid=instance_uuid)
 
-    def _reschedule_or_reraise(self, context, instance, exc_info,
+    def _reschedule_or_error(self, context, instance, exc_info,
             requested_networks, admin_password, injected_files, is_first_time,
             request_spec, filter_properties, bdms=None):
         """Try to re-schedule the build or re-raise the original build error to
@@ -982,12 +1024,7 @@ class ComputeManager(manager.SchedulerDependentManager):
             LOG.exception(_("Error trying to reschedule"),
                           instance_uuid=instance_uuid)
 
-        if rescheduled:
-            # log the original build error
-            self._log_original_error(exc_info, instance_uuid)
-        else:
-            # not re-scheduling
-            raise exc_info[0], exc_info[1], exc_info[2]
+        return rescheduled
 
     def _reschedule(self, context, request_spec, filter_properties,
             instance_uuid, scheduler_method, method_args, task_state,
@@ -1751,9 +1788,15 @@ class ComputeManager(manager.SchedulerDependentManager):
         self._notify_about_instance_usage(context, instance, "reboot.start")
 
         current_power_state = self._get_power_state(context, instance)
+
+        # Don't change it out of rescue mode
+        new_vm_state = vm_states.ACTIVE
+        if instance['vm_state'] == vm_states.RESCUED:
+            new_vm_state = vm_states.RESCUED
+
         instance = self._instance_update(context, instance['uuid'],
                                          power_state=current_power_state,
-                                         vm_state=vm_states.ACTIVE)
+                                         vm_state=new_vm_state)
 
         if instance['power_state'] != power_state.RUNNING:
             state = instance['power_state']
@@ -2001,7 +2044,6 @@ class ComputeManager(manager.SchedulerDependentManager):
     @exception.wrap_exception(notifier=notifier, publisher_id=publisher_id())
     @reverts_task_state
     @wrap_instance_event
-    @wrap_instance_fault
     def rescue_instance(self, context, instance, rescue_password=None):
         """
         Rescue an instance on this host.
@@ -2022,10 +2064,16 @@ class ComputeManager(manager.SchedulerDependentManager):
         else:
             rescue_image_meta = {}
 
-        with self._error_out_instance_on_exception(context, instance['uuid']):
+        try:
             self.driver.rescue(context, instance,
                                self._legacy_nw_info(network_info),
                                rescue_image_meta, admin_password)
+        except Exception as e:
+            LOG.exception(_("Error trying to Rescue Instance"),
+                          instance=instance)
+            raise exception.InstanceNotRescuable(
+                instance_id=instance['uuid'],
+                reason=_("Driver Error: %s") % unicode(e))
 
         current_power_state = self._get_power_state(context, instance)
         self._instance_update(context,
@@ -2119,8 +2167,11 @@ class ComputeManager(manager.SchedulerDependentManager):
             self.driver.confirm_migration(migration, instance,
                                           self._legacy_nw_info(network_info))
 
+            self.conductor_api.migration_update(context, migration,
+                                                'confirmed')
+
             rt = self._get_resource_tracker(migration['source_node'])
-            rt.confirm_resize(context, migration)
+            rt.drop_resize_claim(instance, prefix='old_')
 
             instance = self._instance_update(context, instance['uuid'],
                                              vm_state=vm_states.ACTIVE,
@@ -2172,8 +2223,10 @@ class ComputeManager(manager.SchedulerDependentManager):
 
             self._terminate_volume_connections(context, instance)
 
+            self.conductor_api.migration_update(context, migration, 'reverted')
+
             rt = self._get_resource_tracker(instance.get('node'))
-            rt.revert_resize(context, migration, status='reverted_dest')
+            rt.drop_resize_claim(instance)
 
             self.compute_rpcapi.finish_revert_resize(context, instance,
                     migration, migration['source_compute'],
@@ -2261,9 +2314,6 @@ class ComputeManager(manager.SchedulerDependentManager):
 
             instance = self._instance_update(context, instance['uuid'],
                     vm_state=vm_states.ACTIVE, task_state=None)
-
-            rt = self._get_resource_tracker(instance.get('node'))
-            rt.revert_resize(context, migration)
 
             self._notify_about_instance_usage(
                     context, instance, "resize.revert.end")
@@ -3705,33 +3755,31 @@ class ComputeManager(manager.SchedulerDependentManager):
     def _poll_volume_usage(self, context, start_time=None):
         if CONF.volume_usage_poll_interval == 0:
             return
-        else:
-            if not start_time:
-                start_time = utils.last_completed_audit_period()[1]
 
-            curr_time = time.time()
-            if (curr_time - self._last_vol_usage_poll) < \
-                    CONF.volume_usage_poll_interval:
-                return
-            else:
-                self._last_vol_usage_poll = curr_time
-                compute_host_bdms = self._get_host_volume_bdms(context,
-                                                               self.host)
-                if not compute_host_bdms:
-                    return
-                else:
-                    LOG.debug(_("Updating volume usage cache"))
-                    try:
-                        vol_usages = self.driver.get_all_volume_usage(context,
-                              compute_host_bdms)
-                    except NotImplementedError:
-                        return
+        if not start_time:
+            start_time = utils.last_completed_audit_period()[1]
 
-                    refreshed = timeutils.utcnow()
-                    self._update_volume_usage_cache(context, vol_usages,
-                                                    refreshed)
+        curr_time = time.time()
+        if (curr_time - self._last_vol_usage_poll) < \
+                CONF.volume_usage_poll_interval:
+            return
 
-                self._send_volume_usage_notifications(context, start_time)
+        self._last_vol_usage_poll = curr_time
+        compute_host_bdms = self._get_host_volume_bdms(context, self.host)
+        if not compute_host_bdms:
+            return
+
+        LOG.debug(_("Updating volume usage cache"))
+        try:
+            vol_usages = self.driver.get_all_volume_usage(context,
+                                                          compute_host_bdms)
+        except NotImplementedError:
+            return
+
+        refreshed = timeutils.utcnow()
+        self._update_volume_usage_cache(context, vol_usages, refreshed)
+
+        self._send_volume_usage_notifications(context, start_time)
 
     @manager.periodic_task
     def _report_driver_status(self, context):
@@ -3794,7 +3842,8 @@ class ComputeManager(manager.SchedulerDependentManager):
         # We re-query the DB to get the latest instance info to minimize
         # (not eliminate) race condition.
         u = self.conductor_api.instance_get_by_uuid(context,
-                                                    db_instance['uuid'])
+                                                    db_instance['uuid'],
+                                                    columns_to_join=[])
         db_power_state = u["power_state"]
         vm_state = u['vm_state']
 

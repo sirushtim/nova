@@ -20,6 +20,7 @@ import contextlib
 import fixtures
 import mox
 
+from nova import exception
 from nova import test
 from nova import utils
 from nova.virt.xenapi import vm_utils
@@ -32,6 +33,62 @@ def contextified(result):
 
 def _fake_noop(*args, **kwargs):
     return
+
+
+class LookupTestCase(test.TestCase):
+
+    def setUp(self):
+        super(LookupTestCase, self).setUp()
+        self.session = self.mox.CreateMockAnything('Fake Session')
+        self.name_label = 'my_vm'
+
+    def _do_mock(self, result):
+        self.session.call_xenapi(
+            "VM.get_by_name_label", self.name_label).AndReturn(result)
+        self.mox.ReplayAll()
+
+    def test_normal(self):
+        self._do_mock(['x'])
+        result = vm_utils.lookup(self.session, self.name_label)
+        self.assertEqual('x', result)
+
+    def test_no_result(self):
+        self._do_mock([])
+        result = vm_utils.lookup(self.session, self.name_label)
+        self.assertEqual(None, result)
+
+    def test_too_many(self):
+        self._do_mock(['a', 'b'])
+        self.assertRaises(exception.InstanceExists,
+                          vm_utils.lookup,
+                          self.session, self.name_label)
+
+    def test_rescue_none(self):
+        self.session.call_xenapi(
+            "VM.get_by_name_label", self.name_label + '-rescue').AndReturn([])
+        self._do_mock(['x'])
+        result = vm_utils.lookup(self.session, self.name_label,
+                                 check_rescue=True)
+        self.assertEqual('x', result)
+
+    def test_rescue_found(self):
+        self.session.call_xenapi(
+            "VM.get_by_name_label",
+            self.name_label + '-rescue').AndReturn(['y'])
+        self.mox.ReplayAll()
+        result = vm_utils.lookup(self.session, self.name_label,
+                                 check_rescue=True)
+        self.assertEqual('y', result)
+
+    def test_rescue_too_many(self):
+        self.session.call_xenapi(
+            "VM.get_by_name_label",
+            self.name_label + '-rescue').AndReturn(['a', 'b', 'c'])
+        self.mox.ReplayAll()
+        self.assertRaises(exception.InstanceExists,
+                          vm_utils.lookup,
+                          self.session, self.name_label,
+                          check_rescue=True)
 
 
 class GenerateConfigDriveTestCase(test.TestCase):

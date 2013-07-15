@@ -38,6 +38,7 @@ from sqlalchemy import MetaData
 from sqlalchemy import or_
 from sqlalchemy.orm import joinedload
 from sqlalchemy.orm import joinedload_all
+from sqlalchemy.orm import noload
 from sqlalchemy.schema import Table
 from sqlalchemy.sql.expression import asc
 from sqlalchemy.sql.expression import desc
@@ -1225,6 +1226,20 @@ def fixed_ip_get_by_instance(context, instance_uuid):
     return result
 
 
+@require_admin_context
+def fixed_ip_get_by_host(context, host):
+    session = get_session()
+    with session.begin():
+        instance_uuids = _instance_get_all_uuids_by_host(context, host,
+                                                         session=session)
+        if not instance_uuids:
+            return []
+
+        return model_query(context, models.FixedIp, session=session).\
+                 filter(models.FixedIp.instance_uuid.in_(instance_uuids)).\
+                 all()
+
+
 @require_context
 def fixed_ip_get_by_network_host(context, network_id, host):
     result = model_query(context, models.FixedIp, read_deleted="no").\
@@ -1266,7 +1281,7 @@ def fixed_ip_count_by_project(context, project_id, session=None):
                        session=session).\
                 join((models.Instance,
                       models.Instance.uuid == models.FixedIp.instance_uuid)).\
-                filter(models.Instance.uuid == project_id).\
+                filter(models.Instance.project_id == project_id).\
                 count()
 
 
@@ -1511,13 +1526,15 @@ def instance_destroy(context, instance_uuid, constraint=None):
 
 
 @require_context
-def instance_get_by_uuid(context, uuid):
-    return _instance_get_by_uuid(context, uuid)
+def instance_get_by_uuid(context, uuid, columns_to_join=None):
+    return _instance_get_by_uuid(context, uuid,
+            columns_to_join=columns_to_join)
 
 
 @require_context
-def _instance_get_by_uuid(context, uuid, session=None):
-    result = _build_instance_get(context, session=session).\
+def _instance_get_by_uuid(context, uuid, session=None, columns_to_join=None):
+    result = _build_instance_get(context, session=session,
+                                 columns_to_join=columns_to_join).\
                 filter_by(uuid=uuid).\
                 first()
 
@@ -1545,13 +1562,20 @@ def instance_get(context, instance_id):
 
 
 @require_context
-def _build_instance_get(context, session=None):
-    return model_query(context, models.Instance, session=session,
+def _build_instance_get(context, session=None, columns_to_join=None):
+    query = model_query(context, models.Instance, session=session,
                         project_only=True).\
             options(joinedload_all('security_groups.rules')).\
-            options(joinedload('info_cache')).\
-            options(joinedload('metadata')).\
-            options(joinedload('system_metadata'))
+            options(joinedload('info_cache'))
+    if columns_to_join is None:
+        columns_to_join = ['metadata', 'system_metadata']
+    for column in columns_to_join:
+        query = query.options(joinedload(column))
+    #NOTE(alaski) Stop lazy loading of columns not needed.
+    for col in ['metadata', 'system_metadata']:
+        if col not in columns_to_join:
+            query = query.options(noload(col))
+    return query
 
 
 def _instances_fill_metadata(context, instances, manual_joins=None):
@@ -1846,6 +1870,22 @@ def instance_get_all_by_host(context, host, columns_to_join=None):
     return _instances_fill_metadata(context,
         _instance_get_all_query(context).filter_by(host=host).all(),
                                 manual_joins=columns_to_join)
+
+
+@require_admin_context
+def _instance_get_all_uuids_by_host(context, host, session=None):
+    """Return a list of the instance uuids on a given host.
+
+    Returns a list of UUIDs, not Instance model objects. This internal version
+    allows you to specify a session object as a kwarg.
+    """
+    uuids = []
+    for tuple in model_query(context, models.Instance.uuid, read_deleted="no",
+                             base_model=models.Instance, session=session).\
+                filter_by(host=host).\
+                all():
+        uuids.append(tuple[0])
+    return uuids
 
 
 @require_admin_context
@@ -3751,6 +3791,10 @@ def instance_type_destroy(context, name):
         session.query(models.InstanceTypeExtraSpecs).\
                 filter_by(instance_type_id=instance_type_id).\
                 soft_delete()
+        model_query(context, models.InstanceTypeProjects,
+                    session=session, read_deleted="no").\
+                filter_by(instance_type_id=instance_type_id).\
+                soft_delete()
 
 
 @require_context
@@ -3765,7 +3809,8 @@ def instance_type_access_get_by_flavor_id(context, flavor_id):
     instance_type_ref = _instance_type_get_query(context).\
                     filter_by(flavorid=flavor_id).\
                     first()
-
+    if not instance_type_ref:
+        return []
     return [r for r in instance_type_ref.projects]
 
 
@@ -3804,6 +3849,83 @@ def instance_type_access_remove(context, flavor_id, project_id):
         if count == 0:
             raise exception.FlavorAccessNotFound(flavor_id=flavor_id,
                                                  project_id=project_id)
+
+
+def _instance_type_extra_specs_get_query(context, flavor_id,
+                                         session=None):
+    # Two queries necessary because join with update doesn't work.
+    t = model_query(context, models.InstanceTypes.id,
+                    base_model=models.InstanceTypes, session=session,
+                    read_deleted="no").\
+              filter(models.InstanceTypes.flavorid == flavor_id).\
+              subquery()
+    return model_query(context, models.InstanceTypeExtraSpecs,
+                       session=session, read_deleted="no").\
+                       filter(models.InstanceTypeExtraSpecs.
+                              instance_type_id.in_(t))
+
+
+@require_context
+def instance_type_extra_specs_get(context, flavor_id):
+    rows = _instance_type_extra_specs_get_query(
+                            context, flavor_id).\
+                    all()
+
+    result = {}
+    for row in rows:
+        result[row['key']] = row['value']
+
+    return result
+
+
+@require_context
+def instance_type_extra_specs_delete(context, flavor_id, key):
+    # Don't need synchronize the session since we will not use the query result
+    _instance_type_extra_specs_get_query(
+                            context, flavor_id).\
+        filter(models.InstanceTypeExtraSpecs.key == key).\
+        soft_delete(synchronize_session=False)
+
+
+@require_context
+def instance_type_extra_specs_update_or_create(context, flavor_id, specs):
+    # NOTE(boris-42): There is a race condition in this method. We should add
+    #                 UniqueConstraint on (instance_type_id, key, deleted) to
+    #                 avoid duplicated instance_type_extra_specs. This will be
+    #                 possible after bp/db-unique-keys implementation.
+    session = get_session()
+    with session.begin():
+        instance_type_id = model_query(context, models.InstanceTypes.id,
+                                       base_model=models.InstanceTypes,
+                                       session=session, read_deleted="no").\
+            filter(models.InstanceTypes.flavorid == flavor_id).\
+            first()
+        if not instance_type_id:
+            raise exception.FlavorNotFound(flavor_id=flavor_id)
+
+        instance_type_id = instance_type_id.id
+
+        spec_refs = model_query(context, models.InstanceTypeExtraSpecs,
+                                session=session, read_deleted="no").\
+            filter_by(instance_type_id=instance_type_id).\
+            filter(models.InstanceTypeExtraSpecs.key.in_(specs.keys())).\
+            all()
+
+        existing_keys = set()
+        for spec_ref in spec_refs:
+            key = spec_ref["key"]
+            existing_keys.add(key)
+            spec_ref.update({"value": specs[key]})
+
+        for key, value in specs.iteritems():
+            if key in existing_keys:
+                continue
+            spec_ref = models.InstanceTypeExtraSpecs()
+            spec_ref.update({"key": key, "value": value,
+                             "instance_type_id": instance_type_id})
+            session.add(spec_ref)
+
+    return specs
 
 
 ####################
@@ -4161,86 +4283,6 @@ def bw_usage_update(context, uuid, mac, start_period, bw_in, bw_out,
         bwusage.last_ctr_in = last_ctr_in
         bwusage.last_ctr_out = last_ctr_out
         bwusage.save(session=session)
-
-
-####################
-
-
-def _instance_type_extra_specs_get_query(context, flavor_id,
-                                         session=None):
-    # Two queries necessary because join with update doesn't work.
-    t = model_query(context, models.InstanceTypes.id,
-                    base_model=models.InstanceTypes, session=session,
-                    read_deleted="no").\
-              filter(models.InstanceTypes.flavorid == flavor_id).\
-              subquery()
-    return model_query(context, models.InstanceTypeExtraSpecs,
-                       session=session, read_deleted="no").\
-                       filter(models.InstanceTypeExtraSpecs.
-                              instance_type_id.in_(t))
-
-
-@require_context
-def instance_type_extra_specs_get(context, flavor_id):
-    rows = _instance_type_extra_specs_get_query(
-                            context, flavor_id).\
-                    all()
-
-    result = {}
-    for row in rows:
-        result[row['key']] = row['value']
-
-    return result
-
-
-@require_context
-def instance_type_extra_specs_delete(context, flavor_id, key):
-    # Don't need synchronize the session since we will not use the query result
-    _instance_type_extra_specs_get_query(
-                            context, flavor_id).\
-        filter(models.InstanceTypeExtraSpecs.key == key).\
-        soft_delete(synchronize_session=False)
-
-
-@require_context
-def instance_type_extra_specs_update_or_create(context, flavor_id, specs):
-    # NOTE(boris-42): There is a race condition in this method. We should add
-    #                 UniqueConstraint on (instance_type_id, key, deleted) to
-    #                 avoid duplicated instance_type_extra_specs. This will be
-    #                 possible after bp/db-unique-keys implementation.
-    session = get_session()
-    with session.begin():
-        instance_type_id = model_query(context, models.InstanceTypes.id,
-                                       base_model=models.InstanceTypes,
-                                       session=session, read_deleted="no").\
-            filter(models.InstanceTypes.flavorid == flavor_id).\
-            first()
-        if not instance_type_id:
-            raise exception.FlavorNotFound(flavor_id=flavor_id)
-
-        instance_type_id = instance_type_id.id
-
-        spec_refs = model_query(context, models.InstanceTypeExtraSpecs,
-                                session=session, read_deleted="no").\
-            filter_by(instance_type_id=instance_type_id).\
-            filter(models.InstanceTypeExtraSpecs.key.in_(specs.keys())).\
-            all()
-
-        existing_keys = set()
-        for spec_ref in spec_refs:
-            key = spec_ref["key"]
-            existing_keys.add(key)
-            spec_ref.update({"value": specs[key]})
-
-        for key, value in specs.iteritems():
-            if key in existing_keys:
-                continue
-            spec_ref = models.InstanceTypeExtraSpecs()
-            spec_ref.update({"key": key, "value": value,
-                             "instance_type_id": instance_type_id})
-            session.add(spec_ref)
-
-    return specs
 
 
 ####################
@@ -4912,6 +4954,9 @@ def _get_default_deleted_value(table):
     # from the column, but I don't see a way to do that in the low-level APIs
     # of SQLAlchemy 0.7.  0.8 has better introspection APIs, which we should
     # use when Nova is ready to require 0.8.
+
+    # NOTE(mikal): this is a little confusing. This method returns the value
+    # that a _not_deleted_ row would have.
     deleted_column_type = table.c.deleted.type
     if isinstance(deleted_column_type, Integer):
         return 0

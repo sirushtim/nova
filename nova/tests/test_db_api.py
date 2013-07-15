@@ -20,6 +20,7 @@
 """Unit tests for the DB API."""
 
 import datetime
+import types
 import uuid as stdlib_uuid
 
 from oslo.config import cfg
@@ -30,6 +31,7 @@ from sqlalchemy.sql.expression import select
 
 from nova import context
 from nova import db
+from nova.db.sqlalchemy import api as sqlalchemy_api
 from nova import exception
 from nova.openstack.common.db.sqlalchemy import session as db_session
 from nova.openstack.common import timeutils
@@ -204,6 +206,45 @@ class DbApiTestCase(DbTestCase):
                                                 {'display_name': u'test'})
         self.assertEqual(1, len(result))
 
+    def test_instance_get_by_uuid(self):
+        inst = self.create_instances_with_args()
+        fake_meta, fake_sys = self.create_metadata_for_instance(inst['uuid'])
+        result = db.instance_get_by_uuid(self.context, inst['uuid'])
+        meta = utils.metadata_to_dict(result['metadata'])
+        self.assertEqual(meta, fake_meta)
+        sys_meta = utils.metadata_to_dict(result['system_metadata'])
+        self.assertEqual(sys_meta, fake_sys)
+
+    def test_instance_get_by_uuid_join_empty(self):
+        inst = self.create_instances_with_args()
+        fake_meta, fake_sys = self.create_metadata_for_instance(inst['uuid'])
+        result = db.instance_get_by_uuid(self.context, inst['uuid'],
+                columns_to_join=[])
+        meta = utils.metadata_to_dict(result['metadata'])
+        self.assertEqual(meta, {})
+        sys_meta = utils.metadata_to_dict(result['system_metadata'])
+        self.assertEqual(sys_meta, {})
+
+    def test_instance_get_by_uuid_join_meta(self):
+        inst = self.create_instances_with_args()
+        fake_meta, fake_sys = self.create_metadata_for_instance(inst['uuid'])
+        result = db.instance_get_by_uuid(self.context, inst['uuid'],
+                columns_to_join=['metadata'])
+        meta = utils.metadata_to_dict(result['metadata'])
+        self.assertEqual(meta, fake_meta)
+        sys_meta = utils.metadata_to_dict(result['system_metadata'])
+        self.assertEqual(sys_meta, {})
+
+    def test_instance_get_by_uuid_join_sys_meta(self):
+        inst = self.create_instances_with_args()
+        fake_meta, fake_sys = self.create_metadata_for_instance(inst['uuid'])
+        result = db.instance_get_by_uuid(self.context, inst['uuid'],
+                columns_to_join=['system_metadata'])
+        meta = utils.metadata_to_dict(result['metadata'])
+        self.assertEqual(meta, {})
+        sys_meta = utils.metadata_to_dict(result['system_metadata'])
+        self.assertEqual(sys_meta, fake_sys)
+
     def test_instance_get_all_by_filters_deleted(self):
         inst1 = self.create_instances_with_args()
         inst2 = self.create_instances_with_args(reservation_id='b')
@@ -319,6 +360,27 @@ class DbApiTestCase(DbTestCase):
         floating = db.floating_ip_create(ctxt, values)
         fixed_ip_ref = db.fixed_ip_get_by_floating_address(ctxt, floating)
         self.assertEqual(fixed, fixed_ip_ref['address'])
+
+    def test_fixed_ip_get_by_host(self):
+        ctxt = context.get_admin_context()
+
+        values = {'address': 'fixed1'}
+        fixed1 = db.fixed_ip_create(ctxt, values)
+        instance1 = self.create_instances_with_args()
+        db.fixed_ip_associate(ctxt, 'fixed1', instance1['uuid'])
+
+        values = {'address': 'fixed2'}
+        fixed2 = db.fixed_ip_create(ctxt, values)
+        instance2 = self.create_instances_with_args()
+        db.fixed_ip_associate(ctxt, 'fixed2', instance2['uuid'])
+
+        values = {'address': 'fixed3'}
+        fixed3 = db.fixed_ip_create(ctxt, values)
+        instance3 = self.create_instances_with_args(host='host2')
+        db.fixed_ip_associate(ctxt, 'fixed3', instance3['uuid'])
+
+        result = db.fixed_ip_get_by_host(ctxt, 'host1')
+        self.assertEqual(2, len(result))
 
     def test_floating_ip_get_by_fixed_address(self):
         ctxt = context.get_admin_context()
@@ -1020,56 +1082,6 @@ class DbApiTestCase(DbTestCase):
         self.assertEqual(db.network_in_use_on_host(ctxt, 1, 'foo'), True)
         self.assertEqual(db.network_in_use_on_host(ctxt, 1, 'bar'), False)
 
-    def _timeout_test(self, ctxt, timeout, multi_host):
-        values = {'host': 'foo'}
-        instance = db.instance_create(ctxt, values)
-        values = {'multi_host': multi_host, 'host': 'bar'}
-        net = db.network_create_safe(ctxt, values)
-        old = time = timeout - datetime.timedelta(seconds=5)
-        new = time = timeout + datetime.timedelta(seconds=5)
-        # should deallocate
-        values = {'allocated': False,
-                  'instance_uuid': instance['uuid'],
-                  'network_id': net['id'],
-                  'updated_at': old}
-        db.fixed_ip_create(ctxt, values)
-        # still allocated
-        values = {'allocated': True,
-                  'instance_uuid': instance['uuid'],
-                  'network_id': net['id'],
-                  'updated_at': old}
-        db.fixed_ip_create(ctxt, values)
-        # wrong network
-        values = {'allocated': False,
-                  'instance_uuid': instance['uuid'],
-                  'network_id': None,
-                  'updated_at': old}
-        db.fixed_ip_create(ctxt, values)
-        # too new
-        values = {'allocated': False,
-                  'instance_uuid': instance['uuid'],
-                  'network_id': None,
-                  'updated_at': new}
-        db.fixed_ip_create(ctxt, values)
-
-    def test_fixed_ip_disassociate_all_by_timeout_single_host(self):
-        now = timeutils.utcnow()
-        ctxt = context.get_admin_context()
-        self._timeout_test(ctxt, now, False)
-        result = db.fixed_ip_disassociate_all_by_timeout(ctxt, 'foo', now)
-        self.assertEqual(result, 0)
-        result = db.fixed_ip_disassociate_all_by_timeout(ctxt, 'bar', now)
-        self.assertEqual(result, 1)
-
-    def test_fixed_ip_disassociate_all_by_timeout_multi_host(self):
-        now = timeutils.utcnow()
-        ctxt = context.get_admin_context()
-        self._timeout_test(ctxt, now, True)
-        result = db.fixed_ip_disassociate_all_by_timeout(ctxt, 'foo', now)
-        self.assertEqual(result, 1)
-        result = db.fixed_ip_disassociate_all_by_timeout(ctxt, 'bar', now)
-        self.assertEqual(result, 0)
-
     def test_get_vol_mapping_non_admin(self):
         ref = db.ec2_volume_create(self.context, 'fake-uuid')
         ec2_id = db.get_ec2_volume_id_by_uuid(self.context, 'fake-uuid')
@@ -1616,6 +1628,26 @@ class AggregateDBApiTestCase(test.TestCase):
                           ctxt, result['id'], _get_fake_aggr_hosts()[0])
 
 
+class SqlAlchemyDbApiTestCase(DbTestCase):
+    def test_instance_get_all_by_host(self):
+        ctxt = context.get_admin_context()
+
+        self.create_instances_with_args()
+        self.create_instances_with_args()
+        self.create_instances_with_args(host='host2')
+        result = sqlalchemy_api._instance_get_all_uuids_by_host(ctxt, 'host1')
+        self.assertEqual(2, len(result))
+
+    def test_instance_get_all_uuids_by_host(self):
+        ctxt = context.get_admin_context()
+        self.create_instances_with_args()
+        self.create_instances_with_args()
+        self.create_instances_with_args(host='host2')
+        result = sqlalchemy_api._instance_get_all_uuids_by_host(ctxt, 'host1')
+        self.assertEqual(2, len(result))
+        self.assertEqual(types.UnicodeType, type(result[0]))
+
+
 class CapacityTestCase(test.TestCase):
     def setUp(self):
         super(CapacityTestCase, self).setUp()
@@ -1816,6 +1848,14 @@ class ModelsObjectComparatorMixin(object):
         objs2 = dict([(o['id'], o) for o in objs2])
         for o1 in objs1:
             self._assertEqualObjects(o1, objs2[o1['id']], ignored_keys)
+
+    def _assertEqualListsOfPrimitivesAsSets(self, primitives1, primitives2):
+        self.assertEqual(len(primitives1), len(primitives2))
+        for primitive in primitives1:
+            self.assertIn(primitive, primitives2)
+
+        for primitive in primitives2:
+            self.assertIn(primitive, primitives1)
 
 
 class ServiceTestCase(test.TestCase, ModelsObjectComparatorMixin):
@@ -2043,6 +2083,10 @@ class InstanceTypeTestCase(BaseInstanceTypeTestCase):
 
         r_inst_type2 = db.instance_type_get(self.ctxt, inst_type2['id'])
         self._assertEqualObjects(inst_type2, r_inst_type2, 'extra_specs')
+
+    def test_instance_type_destroy_not_found(self):
+        self.assertRaises(exception.InstanceTypeNotFound,
+                          db.instance_type_destroy, self.ctxt, 'nonexists')
 
     def test_instance_type_create_duplicate_name(self):
         self._create_inst_type({})
@@ -2306,33 +2350,230 @@ class InstanceTypeAccessTestCase(BaseInstanceTypeTestCase):
                           db.instance_type_access_remove,
                           self.ctxt, inst_type['flavorid'], 'p2')
 
+    def test_instance_type_access_removed_after_instance_type_destroy(self):
+        inst_type1 = self._create_inst_type({'flavorid': 'f1', 'name': 'n1'})
+        inst_type2 = self._create_inst_type({'flavorid': 'f2', 'name': 'n2'})
+        values = [
+            (inst_type1['flavorid'], 'p1'),
+            (inst_type1['flavorid'], 'p2'),
+            (inst_type2['flavorid'], 'p3')
+        ]
+        for v in values:
+            self._create_inst_type_access(*v)
 
-class TestFixedIPGetByNetworkHost(test.TestCase):
-    def test_not_found_exception(self):
-        ctxt = context.get_admin_context()
+        db.instance_type_destroy(self.ctxt, inst_type1['name'])
 
+        p = (self.ctxt, inst_type1['flavorid'])
+        self.assertEqual(0, len(db.instance_type_access_get_by_flavor_id(*p)))
+        p = (self.ctxt, inst_type2['flavorid'])
+        self.assertEqual(1, len(db.instance_type_access_get_by_flavor_id(*p)))
+        db.instance_type_destroy(self.ctxt, inst_type2['name'])
+        self.assertEqual(0, len(db.instance_type_access_get_by_flavor_id(*p)))
+
+
+class FixedIPTestCase(BaseInstanceTypeTestCase):
+    def _timeout_test(self, ctxt, timeout, multi_host):
+        instance = db.instance_create(ctxt, dict(host='foo'))
+        net = db.network_create_safe(ctxt, dict(multi_host=multi_host,
+                                                host='bar'))
+        old = timeout - datetime.timedelta(seconds=5)
+        new = timeout + datetime.timedelta(seconds=5)
+        # should deallocate
+        db.fixed_ip_create(ctxt, dict(allocated=False,
+                                      instance_uuid=instance['uuid'],
+                                      network_id=net['id'],
+                                      updated_at=old))
+        # still allocated
+        db.fixed_ip_create(ctxt, dict(allocated=True,
+                                      instance_uuid=instance['uuid'],
+                                      network_id=net['id'],
+                                      updated_at=old))
+        # wrong network
+        db.fixed_ip_create(ctxt, dict(allocated=False,
+                                      instance_uuid=instance['uuid'],
+                                      network_id=None,
+                                      updated_at=old))
+        # too new
+        db.fixed_ip_create(ctxt, dict(allocated=False,
+                                      instance_uuid=instance['uuid'],
+                                      network_id=None,
+                                      updated_at=new))
+
+    def test_fixed_ip_disassociate_all_by_timeout_single_host(self):
+        now = timeutils.utcnow()
+        self._timeout_test(self.ctxt, now, False)
+        result = db.fixed_ip_disassociate_all_by_timeout(self.ctxt, 'foo', now)
+        self.assertEqual(result, 0)
+        result = db.fixed_ip_disassociate_all_by_timeout(self.ctxt, 'bar', now)
+        self.assertEqual(result, 1)
+
+    def test_fixed_ip_disassociate_all_by_timeout_multi_host(self):
+        now = timeutils.utcnow()
+        self._timeout_test(self.ctxt, now, True)
+        result = db.fixed_ip_disassociate_all_by_timeout(self.ctxt, 'foo', now)
+        self.assertEqual(result, 1)
+        result = db.fixed_ip_disassociate_all_by_timeout(self.ctxt, 'bar', now)
+        self.assertEqual(result, 0)
+
+    def test_fixed_ip_get_by_network_host_not_found_exception(self):
         self.assertRaises(
             exception.FixedIpNotFoundForNetworkHost,
             db.fixed_ip_get_by_network_host,
-            ctxt, 1, 'ignore')
+            self.ctxt, 1, 'ignore')
 
-    def test_fixed_ip_found(self):
-        ctxt = context.get_admin_context()
-        db.fixed_ip_create(ctxt, dict(network_id=1, host='host'))
+    def test_fixed_ip_get_by_network_host_fixed_ip_found(self):
+        db.fixed_ip_create(self.ctxt, dict(network_id=1, host='host'))
 
-        fip = db.fixed_ip_get_by_network_host(ctxt, 1, 'host')
+        fip = db.fixed_ip_get_by_network_host(self.ctxt, 1, 'host')
 
         self.assertEquals(1, fip['network_id'])
         self.assertEquals('host', fip['host'])
 
+    def _create_instance(self, project_id=None):
+        instance = db.instance_create(self.ctxt, dict(project_id=project_id))
+        return instance['uuid']
 
-class TestIpAllocation(test.TestCase):
+    def test_fixed_ip_get_by_instance_fixed_ip_found(self):
+        instance_uuid = self._create_instance()
 
-    def setUp(self):
-        super(TestIpAllocation, self).setUp()
-        self.ctxt = context.get_admin_context()
-        self.instance = db.instance_create(self.ctxt, {})
-        self.network = db.network_create_safe(self.ctxt, {})
+        FIXED_IP_ADDRESS = 'address'
+        db.fixed_ip_create(self.ctxt, dict(
+            instance_uuid=instance_uuid, address=FIXED_IP_ADDRESS))
+
+        ips_list = db.fixed_ip_get_by_instance(self.ctxt, instance_uuid)
+        self._assertEqualListsOfPrimitivesAsSets([FIXED_IP_ADDRESS],
+                                                 [ips_list[0].address])
+
+    def test_fixed_ip_get_by_instance_multiple_fixed_ips_found(self):
+        instance_uuid = self._create_instance()
+
+        FIXED_IP_ADDRESS_1 = 'address_1'
+        db.fixed_ip_create(self.ctxt, dict(
+            instance_uuid=instance_uuid, address=FIXED_IP_ADDRESS_1))
+        FIXED_IP_ADDRESS_2 = 'address_2'
+        db.fixed_ip_create(self.ctxt, dict(
+            instance_uuid=instance_uuid, address=FIXED_IP_ADDRESS_2))
+
+        ips_list = db.fixed_ip_get_by_instance(self.ctxt, instance_uuid)
+        self._assertEqualListsOfPrimitivesAsSets(
+            [FIXED_IP_ADDRESS_1, FIXED_IP_ADDRESS_2],
+            [ips_list[0].address, ips_list[1].address])
+
+    def test_fixed_ip_get_by_instance_inappropriate_ignored(self):
+        instance_uuid = self._create_instance()
+
+        FIXED_IP_ADDRESS_1 = 'address_1'
+        db.fixed_ip_create(self.ctxt, dict(
+            instance_uuid=instance_uuid, address=FIXED_IP_ADDRESS_1))
+        FIXED_IP_ADDRESS_2 = 'address_2'
+        db.fixed_ip_create(self.ctxt, dict(
+            instance_uuid=instance_uuid, address=FIXED_IP_ADDRESS_2))
+
+        another_instance = db.instance_create(self.ctxt, {})
+        db.fixed_ip_create(self.ctxt, dict(
+            instance_uuid=another_instance['uuid'], address="another_addr"))
+
+        ips_list = db.fixed_ip_get_by_instance(self.ctxt, instance_uuid)
+        self._assertEqualListsOfPrimitivesAsSets(
+            [FIXED_IP_ADDRESS_1, FIXED_IP_ADDRESS_2],
+            [ips_list[0].address, ips_list[1].address])
+
+    def test_fixed_ip_get_by_instance_not_found_exception(self):
+        instance_uuid = self._create_instance()
+
+        self.assertRaises(exception.FixedIpNotFoundForInstance,
+                          db.fixed_ip_get_by_instance,
+                          self.ctxt, instance_uuid)
+
+    def test_fixed_ips_by_virtual_interface_fixed_ip_found(self):
+        instance_uuid = self._create_instance()
+
+        vif = db.virtual_interface_create(
+            self.ctxt, dict(instance_uuid=instance_uuid))
+
+        FIXED_IP_ADDRESS = 'address'
+        db.fixed_ip_create(self.ctxt, dict(
+            virtual_interface_id=vif.id, address=FIXED_IP_ADDRESS))
+
+        ips_list = db.fixed_ips_by_virtual_interface(self.ctxt, vif.id)
+        self._assertEqualListsOfPrimitivesAsSets([FIXED_IP_ADDRESS],
+                                                 [ips_list[0].address])
+
+    def test_fixed_ips_by_virtual_interface_multiple_fixed_ips_found(self):
+        instance_uuid = self._create_instance()
+
+        vif = db.virtual_interface_create(
+            self.ctxt, dict(instance_uuid=instance_uuid))
+
+        FIXED_IP_ADDRESS_1 = 'address_1'
+        db.fixed_ip_create(self.ctxt, dict(
+            virtual_interface_id=vif.id, address=FIXED_IP_ADDRESS_1))
+        FIXED_IP_ADDRESS_2 = 'address_2'
+        db.fixed_ip_create(self.ctxt, dict(
+            virtual_interface_id=vif.id, address=FIXED_IP_ADDRESS_2))
+
+        ips_list = db.fixed_ips_by_virtual_interface(self.ctxt, vif.id)
+        self._assertEqualListsOfPrimitivesAsSets(
+            [FIXED_IP_ADDRESS_1, FIXED_IP_ADDRESS_2],
+            [ips_list[0].address, ips_list[1].address])
+
+    def test_fixed_ips_by_virtual_interface_inappropriate_ignored(self):
+        instance_uuid = self._create_instance()
+
+        vif = db.virtual_interface_create(
+            self.ctxt, dict(instance_uuid=instance_uuid))
+
+        FIXED_IP_ADDRESS_1 = 'address_1'
+        db.fixed_ip_create(self.ctxt, dict(
+            virtual_interface_id=vif.id, address=FIXED_IP_ADDRESS_1))
+        FIXED_IP_ADDRESS_2 = 'address_2'
+        db.fixed_ip_create(self.ctxt, dict(
+            virtual_interface_id=vif.id, address=FIXED_IP_ADDRESS_2))
+
+        another_vif = db.virtual_interface_create(
+            self.ctxt, dict(instance_uuid=instance_uuid))
+        db.fixed_ip_create(self.ctxt, dict(
+            virtual_interface_id=another_vif.id, address="another_addr"))
+
+        ips_list = db.fixed_ips_by_virtual_interface(self.ctxt, vif.id)
+        self._assertEqualListsOfPrimitivesAsSets(
+            [FIXED_IP_ADDRESS_1, FIXED_IP_ADDRESS_2],
+            [ips_list[0].address, ips_list[1].address])
+
+    def test_fixed_ips_by_virtual_interface_no_ip_found(self):
+        instance_uuid = self._create_instance()
+
+        vif = db.virtual_interface_create(
+            self.ctxt, dict(instance_uuid=instance_uuid))
+
+        ips_list = db.fixed_ips_by_virtual_interface(self.ctxt, vif.id)
+        self.assertEquals(0, len(ips_list))
+
+    def test_fixed_ip_count_by_project_one_ip(self):
+        PROJECT_ID = "project_id"
+        instance_uuid = self._create_instance(PROJECT_ID)
+        db.fixed_ip_create(self.ctxt, dict(
+            instance_uuid=instance_uuid, address='address'))
+
+        ips_count = db.fixed_ip_count_by_project(self.ctxt, PROJECT_ID)
+        self.assertEquals(1, ips_count)
+
+    def test_fixed_ip_count_by_project_two_ips_for_different_instances(self):
+        PROJECT_ID = "project_id"
+        instance_uuid = self._create_instance(PROJECT_ID)
+
+        db.fixed_ip_create(self.ctxt, dict(
+            instance_uuid=instance_uuid, address='address_1'))
+
+        another_instance_for_this_project =\
+            db.instance_create(self.ctxt, dict(project_id=PROJECT_ID))
+
+        db.fixed_ip_create(self.ctxt, dict(
+            instance_uuid=another_instance_for_this_project['uuid'],
+            address='address_2'))
+
+        ips_count = db.fixed_ip_count_by_project(self.ctxt, PROJECT_ID)
+        self.assertEquals(2, ips_count)
 
     def create_fixed_ip(self, **params):
         default_params = {'address': '192.168.0.1'}
@@ -2340,30 +2581,39 @@ class TestIpAllocation(test.TestCase):
         return db.fixed_ip_create(self.ctxt, default_params)
 
     def test_fixed_ip_associate_fails_if_ip_not_in_network(self):
+        instance_uuid = self._create_instance()
         self.assertRaises(exception.FixedIpNotFoundForNetwork,
                           db.fixed_ip_associate,
-                          self.ctxt, None, self.instance['uuid'])
+                          self.ctxt, None, instance_uuid)
 
     def test_fixed_ip_associate_fails_if_ip_in_use(self):
-        address = self.create_fixed_ip(instance_uuid=self.instance['uuid'])
+        instance_uuid = self._create_instance()
+
+        address = self.create_fixed_ip(instance_uuid=instance_uuid)
         self.assertRaises(exception.FixedIpAlreadyInUse,
                           db.fixed_ip_associate,
-                          self.ctxt, address, self.instance['uuid'])
+                          self.ctxt, address, instance_uuid)
 
     def test_fixed_ip_associate_succeeds(self):
-        address = self.create_fixed_ip(network_id=self.network['id'])
-        db.fixed_ip_associate(self.ctxt, address, self.instance['uuid'],
-                              network_id=self.network['id'])
+        instance_uuid = self._create_instance()
+        network = db.network_create_safe(self.ctxt, {})
+
+        address = self.create_fixed_ip(network_id=network['id'])
+        db.fixed_ip_associate(self.ctxt, address, instance_uuid,
+                              network_id=network['id'])
         fixed_ip = db.fixed_ip_get_by_address(self.ctxt, address)
-        self.assertEqual(fixed_ip['instance_uuid'], self.instance['uuid'])
+        self.assertEqual(fixed_ip['instance_uuid'], instance_uuid)
 
     def test_fixed_ip_associate_succeeds_and_sets_network(self):
+        instance_uuid = self._create_instance()
+        network = db.network_create_safe(self.ctxt, {})
+
         address = self.create_fixed_ip()
-        db.fixed_ip_associate(self.ctxt, address, self.instance['uuid'],
-                              network_id=self.network['id'])
+        db.fixed_ip_associate(self.ctxt, address, instance_uuid,
+                              network_id=network['id'])
         fixed_ip = db.fixed_ip_get_by_address(self.ctxt, address)
-        self.assertEqual(fixed_ip['instance_uuid'], self.instance['uuid'])
-        self.assertEqual(fixed_ip['network_id'], self.network['id'])
+        self.assertEqual(fixed_ip['instance_uuid'], instance_uuid)
+        self.assertEqual(fixed_ip['network_id'], network['id'])
 
 
 class InstanceDestroyConstraints(test.TestCase):

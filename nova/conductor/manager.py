@@ -49,10 +49,11 @@ datetime_fields = ['launched_at', 'terminated_at', 'updated_at']
 class ConductorManager(manager.Manager):
     """Mission: TBD."""
 
-    RPC_API_VERSION = '1.48'
+    RPC_API_VERSION = '1.49'
 
     def __init__(self, *args, **kwargs):
-        super(ConductorManager, self).__init__(*args, **kwargs)
+        super(ConductorManager, self).__init__(service_name='conductor',
+                                               *args, **kwargs)
         self.security_group_api = (
             openstack_driver.get_openstack_security_group_driver())
         self._network_api = None
@@ -75,6 +76,8 @@ class ConductorManager(manager.Manager):
         return self._compute_api
 
     def ping(self, context, arg):
+        # NOTE(russellb) This method can be removed in 2.0 of this API.  It is
+        # now a part of the base rpc API.
         return jsonutils.to_primitive({'service': 'conductor', 'arg': arg})
 
     @rpc_common.client_exceptions(KeyError, ValueError,
@@ -102,9 +105,11 @@ class ConductorManager(manager.Manager):
             self.db.instance_get(context, instance_id))
 
     @rpc_common.client_exceptions(exception.InstanceNotFound)
-    def instance_get_by_uuid(self, context, instance_uuid):
+    def instance_get_by_uuid(self, context, instance_uuid,
+                             columns_to_join=None):
         return jsonutils.to_primitive(
-            self.db.instance_get_by_uuid(context, instance_uuid))
+            self.db.instance_get_by_uuid(context, instance_uuid,
+                columns_to_join))
 
     def instance_get_all(self, context):
         return jsonutils.to_primitive(self.db.instance_get_all(context))
@@ -202,6 +207,8 @@ class ConductorManager(manager.Manager):
         usage = self.db.bw_usage_get(context, uuid, start_period, mac)
         return jsonutils.to_primitive(usage)
 
+    # NOTE(russellb) This method can be removed in 2.0 of this API.  It is
+    # deprecated in favor of the method in the base API.
     def get_backdoor_port(self, context):
         return self.backdoor_port
 

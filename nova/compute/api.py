@@ -41,6 +41,7 @@ from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova.consoleauth import rpcapi as consoleauth_rpcapi
 from nova import crypto
+from nova import db
 from nova.db import base
 from nova import exception
 from nova import hooks
@@ -1614,7 +1615,7 @@ class API(base.Base):
                 snapshot = self.volume_api.create_snapshot_force(
                     context, volume, name, volume['display_description'])
                 bdm['snapshot_id'] = snapshot['id']
-                del bdm['volume_id']
+                bdm['volume_id'] = None
 
             mapping.append(bdm)
 
@@ -2107,10 +2108,6 @@ class API(base.Base):
         """Retrieve diagnostics for the given instance."""
         return self.compute_rpcapi.get_diagnostics(context, instance=instance)
 
-    def get_backdoor_port(self, context, host_name):
-        """Retrieve backdoor port."""
-        return self.compute_rpcapi.get_backdoor_port(context, host_name)
-
     @wrap_check_policy
     @check_instance_lock
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.RESCUED])
@@ -2563,6 +2560,14 @@ class HostAPI(base.Base):
     def service_get_by_compute_host(self, context, host_name):
         """Get service entry for the given compute hostname."""
         return self.db.service_get_by_compute_host(context, host_name)
+
+    def service_update(self, context, host_name, binary, params_to_update):
+        """
+        Enable / Disable a service.
+        For compute services, this stops new builds and migrations going to
+        the host."""
+        service = db.service_get_by_args(context, host_name, binary)
+        return db.service_update(context, service['id'], params_to_update)
 
     def instance_get_all_by_host(self, context, host_name):
         """Return all instances on the given host."""

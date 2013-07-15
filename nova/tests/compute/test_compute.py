@@ -22,6 +22,7 @@ import base64
 import copy
 import datetime
 import sys
+import testtools
 import time
 import traceback
 import uuid
@@ -279,6 +280,7 @@ class BaseTestCase(test.TestCase):
 
 
 class ComputeVolumeTestCase(BaseTestCase):
+
     def setUp(self):
         super(ComputeVolumeTestCase, self).setUp()
         self.volume_id = 'fake'
@@ -293,11 +295,13 @@ class ComputeVolumeTestCase(BaseTestCase):
                        {'id': self.volume_id})
         self.stubs.Set(self.compute.driver, 'get_volume_connector',
                        lambda *a, **kw: None)
-        self.stubs.Set(self.compute.driver, 'attach_volume',
-                       lambda *a, **kw: None)
         self.stubs.Set(self.compute.volume_api, 'initialize_connection',
                        lambda *a, **kw: {})
+        self.stubs.Set(self.compute.volume_api, 'terminate_connection',
+                       lambda *a, **kw: None)
         self.stubs.Set(self.compute.volume_api, 'attach',
+                       lambda *a, **kw: None)
+        self.stubs.Set(self.compute.volume_api, 'detach',
                        lambda *a, **kw: None)
         self.stubs.Set(self.compute.volume_api, 'check_attach',
                        lambda *a, **kw: None)
@@ -479,6 +483,61 @@ class ComputeVolumeTestCase(BaseTestCase):
         self.assertEquals(payload['read_bytes'], 77)
         self.assertEquals(payload['writes'], 121)
         self.assertEquals(payload['write_bytes'], 165)
+
+    def test_detach_volume_usage(self):
+        # Test that detach volume update the volume usage cache table correctly
+        instance = self._create_fake_instance()
+        vol = {'id': 1,
+               'attach_status': 'in-use',
+               'instance_uuid': instance['uuid']}
+        bdm = {'id': 1,
+               'device_name': '/dev/vdb',
+               'connection_info': '{}',
+               'instance_uuid': instance['uuid'],
+               'volume_id': 1}
+
+        self.mox.StubOutWithMock(self.compute, '_get_instance_volume_bdm')
+        self.mox.StubOutWithMock(self.compute.driver, 'block_stats')
+        self.mox.StubOutWithMock(self.compute, '_get_host_volume_bdms')
+        self.mox.StubOutWithMock(self.compute.driver, 'get_all_volume_usage')
+
+        # The following methods will be called
+        self.compute._get_instance_volume_bdm(self.context, instance, 1).\
+            AndReturn(bdm)
+        self.compute.driver.block_stats(instance['name'], 'vdb').\
+            AndReturn([1L, 30L, 1L, 20L, None])
+        self.compute._get_host_volume_bdms(self.context, 'fake-mini').\
+            AndReturn(bdm)
+        self.compute.driver.get_all_volume_usage(self.context, bdm).\
+            AndReturn([{'volume': 1,
+                        'rd_req': 1,
+                        'rd_bytes': 10,
+                        'wr_req': 1,
+                        'wr_bytes': 5,
+                        'instance': instance}])
+
+        self.mox.ReplayAll()
+
+        self.compute.attach_volume(self.context, 1, '/dev/vdb', instance)
+
+        # Poll volume usage & then detach the volume. This will update the
+        # total fields in the volume usage cache.
+        CONF.volume_usage_poll_interval = 10
+        self.compute._poll_volume_usage(self.context)
+        self.compute.detach_volume(self.context, 1, instance)
+
+        # Check the database for the
+        volume_usages = db.vol_get_usage_by_time(self.context, 0)
+        self.assertEqual(1, len(volume_usages))
+        volume_usage = volume_usages[0]
+        self.assertEqual(0, volume_usage['curr_reads'])
+        self.assertEqual(0, volume_usage['curr_read_bytes'])
+        self.assertEqual(0, volume_usage['curr_writes'])
+        self.assertEqual(0, volume_usage['curr_write_bytes'])
+        self.assertEqual(1, volume_usage['tot_reads'])
+        self.assertEqual(30, volume_usage['tot_read_bytes'])
+        self.assertEqual(1, volume_usage['tot_writes'])
+        self.assertEqual(20, volume_usage['tot_write_bytes'])
 
 
 class ComputeTestCase(BaseTestCase):
@@ -1207,6 +1266,33 @@ class ComputeTestCase(BaseTestCase):
 
         self.compute.terminate_instance(self.context, instance=instance)
 
+    def test_rescue_handle_err(self):
+        # If the driver fails to rescue, instance state should remain the same
+        # and the exception should be converted to InstanceNotRescuable
+        instance = jsonutils.to_primitive(self._create_fake_instance())
+        self.mox.StubOutWithMock(self.compute, '_get_rescue_image_ref')
+        self.mox.StubOutWithMock(nova.virt.fake.FakeDriver, 'rescue')
+
+        self.compute._get_rescue_image_ref(
+            mox.IgnoreArg(), instance).AndReturn('resc_image_ref')
+        nova.virt.fake.FakeDriver.rescue(
+            mox.IgnoreArg(), instance, [], mox.IgnoreArg(), 'password'
+            ).AndRaise(RuntimeError("Try again later"))
+
+        self.mox.ReplayAll()
+
+        expected_message = ('Instance %s cannot be rescued: '
+                            'Driver Error: Try again later' % instance['uuid'])
+        instance['vm_state'] = 'some_random_state'
+
+        with testtools.ExpectedException(
+            exception.InstanceNotRescuable, expected_message):
+                self.compute.rescue_instance(
+                    self.context, instance=instance,
+                    rescue_password='password')
+
+        self.assertEqual('some_random_state', instance['vm_state'])
+
     def test_power_on(self):
         # Ensure instance can be powered on.
 
@@ -1341,7 +1427,8 @@ class ComputeTestCase(BaseTestCase):
         self.compute.terminate_instance(self.context,
                 instance=jsonutils.to_primitive(instance))
 
-    def _test_reboot(self, soft, legacy_nwinfo_driver, test_delete=False):
+    def _test_reboot(self, soft, legacy_nwinfo_driver,
+                     test_delete=False, test_unrescue=False):
         # This is a true unit test, so we don't need the network stubs.
         fake_network.unset_stub_network_methods(self.stubs)
 
@@ -1353,11 +1440,15 @@ class ComputeTestCase(BaseTestCase):
         self.mox.StubOutWithMock(self.compute.driver, 'reboot')
 
         instance = dict(uuid='fake-instance',
-                        power_state='unknown')
+                        power_state='unknown',
+                        vm_state=vm_states.ACTIVE)
         updated_instance1 = dict(uuid='updated-instance1',
                                  power_state='fake')
         updated_instance2 = dict(uuid='updated-instance2',
                                  power_state='fake')
+
+        if test_unrescue:
+            instance['vm_state'] = vm_states.RESCUED
 
         fake_nw_model = network_model.NetworkInfo()
         self.mox.StubOutWithMock(fake_nw_model, 'legacy')
@@ -1388,7 +1479,7 @@ class ComputeTestCase(BaseTestCase):
                 instance).AndReturn(fake_power_state1)
         self.compute._instance_update(econtext, instance['uuid'],
                 power_state=fake_power_state1,
-                vm_state=vm_states.ACTIVE).AndReturn(updated_instance1)
+                vm_state=instance['vm_state']).AndReturn(updated_instance1)
 
         # Reboot should check the driver to see if legacy nwinfo is
         # needed.  If it is, the model's legacy() method should be
@@ -1456,11 +1547,23 @@ class ComputeTestCase(BaseTestCase):
     def test_reboot_soft_and_delete(self):
         self._test_reboot(True, False, True)
 
+    def test_reboot_soft_and_rescued(self):
+        self._test_reboot(True, False, False, True)
+
+    def test_reboot_soft_and_delete_and_rescued(self):
+        self._test_reboot(True, False, True, True)
+
     def test_reboot_hard(self):
         self._test_reboot(False, False)
 
     def test_reboot_hard_and_delete(self):
         self._test_reboot(False, False, True)
+
+    def test_reboot_hard_and_rescued(self):
+        self._test_reboot(False, False, False, True)
+
+    def test_reboot_hard_and_delete_and_rescued(self):
+        self._test_reboot(False, False, True, True)
 
     def test_reboot_soft_legacy_nwinfo_driver(self):
         self._test_reboot(True, True)
@@ -2011,8 +2114,80 @@ class ComputeTestCase(BaseTestCase):
         self.assertTrue(payload['launched_at'])
         image_ref_url = glance.generate_image_url(FAKE_IMAGE_REF)
         self.assertEquals(payload['image_ref_url'], image_ref_url)
+        self.assertEqual('Success', payload['message'])
         self.compute.terminate_instance(self.context,
                 instance=jsonutils.to_primitive(inst_ref))
+
+    def test_run_instance_end_notification_on_abort(self):
+        # Test that an end notif is sent if the build is aborted
+        instance = jsonutils.to_primitive(self._create_fake_instance())
+        instance_uuid = instance['uuid']
+
+        def build_inst_abort(*args, **kwargs):
+            raise exception.BuildAbortException(reason="already deleted",
+                    instance_uuid=instance_uuid)
+
+        self.stubs.Set(self.compute, '_build_instance', build_inst_abort)
+
+        self.compute.run_instance(self.context, instance=instance)
+        self.assertEquals(len(test_notifier.NOTIFICATIONS), 2)
+        msg = test_notifier.NOTIFICATIONS[0]
+        self.assertEquals(msg['event_type'], 'compute.instance.create.start')
+        msg = test_notifier.NOTIFICATIONS[1]
+
+        self.assertEquals(msg['event_type'], 'compute.instance.create.end')
+        self.assertEquals('INFO', msg['priority'])
+        payload = msg['payload']
+        message = payload['message']
+        self.assertTrue(message.find("already deleted") != -1)
+
+    def test_run_instance_error_notification_on_reschedule(self):
+        # Test that error notif is sent if the build got rescheduled
+        instance = jsonutils.to_primitive(self._create_fake_instance())
+        instance_uuid = instance['uuid']
+
+        def build_inst_fail(*args, **kwargs):
+            raise exception.RescheduledException(instance_uuid=instance_uuid,
+                    reason="something bad happened")
+
+        self.stubs.Set(self.compute, '_build_instance', build_inst_fail)
+
+        self.compute.run_instance(self.context, instance=instance)
+
+        self.assertTrue(len(test_notifier.NOTIFICATIONS) >= 2)
+        msg = test_notifier.NOTIFICATIONS[0]
+        self.assertEquals(msg['event_type'], 'compute.instance.create.start')
+        msg = test_notifier.NOTIFICATIONS[1]
+
+        self.assertEquals(msg['event_type'], 'compute.instance.create.error')
+        self.assertEquals('ERROR', msg['priority'])
+        payload = msg['payload']
+        message = payload['message']
+        self.assertTrue(message.find("something bad happened") != -1)
+
+    def test_run_instance_error_notification_on_failure(self):
+        # Test that error notif is sent if build fails hard
+        instance = jsonutils.to_primitive(self._create_fake_instance())
+        instance_uuid = instance['uuid']
+
+        def build_inst_fail(*args, **kwargs):
+            raise test.TestingException("i'm dying")
+
+        self.stubs.Set(self.compute, '_build_instance', build_inst_fail)
+
+        self.assertRaises(test.TestingException, self.compute.run_instance,
+                self.context, instance=instance)
+
+        self.assertTrue(len(test_notifier.NOTIFICATIONS) >= 2)
+        msg = test_notifier.NOTIFICATIONS[0]
+        self.assertEquals(msg['event_type'], 'compute.instance.create.start')
+        msg = test_notifier.NOTIFICATIONS[1]
+
+        self.assertEquals(msg['event_type'], 'compute.instance.create.error')
+        self.assertEquals('ERROR', msg['priority'])
+        payload = msg['payload']
+        message = payload['message']
+        self.assertTrue(message.find("i'm dying") != -1)
 
     def test_terminate_usage_notification(self):
         # Ensure terminate_instance generates correct usage notification.
@@ -3813,7 +3988,8 @@ class ComputeTestCase(BaseTestCase):
                                'instance_uuid': instance['uuid'],
                                'status': None})
 
-        def fake_instance_get_by_uuid(context, instance_uuid):
+        def fake_instance_get_by_uuid(context, instance_uuid,
+                cols_to_join=None):
             # raise InstanceNotFound exception for uuid 'noexist'
             if instance_uuid == 'noexist':
                 raise exception.InstanceNotFound(instance_id=instance_uuid)
@@ -6746,24 +6922,6 @@ class ComputeAPITestCase(BaseTestCase):
 
         db.instance_destroy(self.context, instance['uuid'])
 
-    def test_get_backdoor_port(self):
-        # Test api call to get backdoor_port.
-        fake_backdoor_port = 59697
-
-        self.mox.StubOutWithMock(rpc, 'call')
-
-        rpc_msg = {'method': 'get_backdoor_port',
-                   'namespace': None,
-                   'args': {},
-                   'version': compute_rpcapi.ComputeAPI.BASE_RPC_API_VERSION}
-        rpc.call(self.context, 'compute.fake_host', rpc_msg,
-                 None).AndReturn(fake_backdoor_port)
-
-        self.mox.ReplayAll()
-
-        port = self.compute_api.get_backdoor_port(self.context, 'fake_host')
-        self.assertEqual(port, fake_backdoor_port)
-
     def test_console_output(self):
         fake_instance = {'uuid': 'fake_uuid',
                          'host': 'fake_compute_host'}
@@ -7453,19 +7611,6 @@ class ComputeAPIAggrTestCase(BaseTestCase):
                           self.context, aggr['id'], 'invalid_host')
 
 
-class ComputeBackdoorPortTestCase(BaseTestCase):
-    """This is for unit test coverage of backdoor port rpc."""
-
-    def setUp(self):
-        super(ComputeBackdoorPortTestCase, self).setUp()
-        self.context = context.get_admin_context()
-        self.compute.backdoor_port = 59697
-
-    def test_get_backdoor_port(self):
-        port = self.compute.get_backdoor_port(self.context)
-        self.assertEqual(port, self.compute.backdoor_port)
-
-
 class ComputeAggrTestCase(BaseTestCase):
     """This is for unit coverage of aggregate-related methods
     defined in nova.compute.manager."""
@@ -7929,26 +8074,28 @@ class InnerTestingException(Exception):
     pass
 
 
-class ComputeRescheduleOrReraiseTestCase(BaseTestCase):
+class ComputeRescheduleOrErrorTestCase(BaseTestCase):
     """Test logic and exception handling around rescheduling or re-raising
     original exceptions when builds fail.
     """
 
     def setUp(self):
-        super(ComputeRescheduleOrReraiseTestCase, self).setUp()
+        super(ComputeRescheduleOrErrorTestCase, self).setUp()
         self.instance = self._create_fake_instance()
 
-    def test_reschedule_or_reraise_called(self):
-        """Basic sanity check to make sure _reschedule_or_reraise is called
+    def test_reschedule_or_error_called(self):
+        """Basic sanity check to make sure _reschedule_or_error is called
         when a build fails.
         """
         self.mox.StubOutWithMock(self.compute, '_spawn')
-        self.mox.StubOutWithMock(self.compute, '_reschedule_or_reraise')
+        self.mox.StubOutWithMock(self.compute, '_reschedule_or_error')
 
-        self.compute._spawn(mox.IgnoreArg(), self.instance, None, None, None,
-                False, None).AndRaise(test.TestingException("BuildError"))
-        self.compute._reschedule_or_reraise(mox.IgnoreArg(), self.instance,
-                mox.IgnoreArg(), None, None, None, False, None, {}, [])
+        self.compute._spawn(mox.IgnoreArg(), self.instance, mox.IgnoreArg(),
+                [], mox.IgnoreArg(), [], None, set_access_ip=False).AndRaise(
+                        test.TestingException("BuildError"))
+        self.compute._reschedule_or_error(mox.IgnoreArg(), self.instance,
+                mox.IgnoreArg(), None, None, None, False, None, {}, []).\
+                        AndReturn(True)
 
         self.mox.ReplayAll()
         self.compute._run_instance(self.context, None, {}, None, None, None,
@@ -7978,11 +8125,16 @@ class ComputeRescheduleOrReraiseTestCase(BaseTestCase):
             # should raise the deallocation exception, not the original build
             # error:
             self.assertRaises(InnerTestingException,
-                    self.compute._reschedule_or_reraise, self.context,
+                    self.compute._reschedule_or_error, self.context,
                     self.instance, exc_info, None, None, None, False, None, {})
 
     def test_reschedule_fail(self):
         # Test handling of exception from _reschedule.
+        try:
+            raise test.TestingException("Original")
+        except Exception:
+            exc_info = sys.exc_info()
+
         instance_uuid = self.instance['uuid']
         method_args = (None, None, None, None, False, {})
         self.mox.StubOutWithMock(self.compute, '_shutdown_instance')
@@ -7995,19 +8147,13 @@ class ComputeRescheduleOrReraiseTestCase(BaseTestCase):
                                         mox.IgnoreArg())
         self.compute._reschedule(self.context, None, instance_uuid,
                 {}, self.compute.scheduler_rpcapi.run_instance,
-                method_args, task_states.SCHEDULING).AndRaise(
+                method_args, task_states.SCHEDULING, exc_info).AndRaise(
                         InnerTestingException("Inner"))
 
         self.mox.ReplayAll()
 
-        try:
-            raise test.TestingException("Original")
-        except Exception:
-            # not re-scheduling, should raise the original build error:
-            exc_info = sys.exc_info()
-            self.assertRaises(test.TestingException,
-                    self.compute._reschedule_or_reraise, self.context,
-                    self.instance, exc_info, None, None, None, False, None, {})
+        self.assertFalse(self.compute._reschedule_or_error(self.context,
+            self.instance, exc_info, None, None, None, False, None, {}))
 
     def test_reschedule_false(self):
         # Test not-rescheduling, but no nested exception.
@@ -8037,9 +8183,8 @@ class ComputeRescheduleOrReraiseTestCase(BaseTestCase):
 
             # re-scheduling is False, the original build error should be
             # raised here:
-            self.assertRaises(test.TestingException,
-                    self.compute._reschedule_or_reraise, self.context,
-                    self.instance, exc_info, None, None, None, False, None, {})
+            self.assertFalse(self.compute._reschedule_or_error(self.context,
+                self.instance, exc_info, None, None, None, False, None, {}))
 
     def test_reschedule_true(self):
         # Test behavior when re-scheduling happens.
@@ -8071,14 +8216,14 @@ class ComputeRescheduleOrReraiseTestCase(BaseTestCase):
 
             # re-scheduling is True, original error is logged, but nothing
             # is raised:
-            self.compute._reschedule_or_reraise(self.context, self.instance,
+            self.compute._reschedule_or_error(self.context, self.instance,
                     exc_info, None, None, None, False, None, {})
 
     def test_no_reschedule_on_delete_during_spawn(self):
         # instance should not be rescheduled if instance is deleted
         # during the build
         self.mox.StubOutWithMock(self.compute, '_spawn')
-        self.mox.StubOutWithMock(self.compute, '_reschedule_or_reraise')
+        self.mox.StubOutWithMock(self.compute, '_reschedule_or_error')
 
         exc = exception.UnexpectedTaskStateError(expected=task_states.SPAWNING,
                 actual=task_states.DELETING)
@@ -8087,7 +8232,7 @@ class ComputeRescheduleOrReraiseTestCase(BaseTestCase):
                 mox.IgnoreArg(), set_access_ip=False).AndRaise(exc)
 
         self.mox.ReplayAll()
-        # test succeeds if mocked method '_reschedule_or_reraise' is not
+        # test succeeds if mocked method '_reschedule_or_error' is not
         # called.
         self.compute._run_instance(self.context, None, {}, None, None, None,
                 False, None, self.instance)
@@ -8096,7 +8241,7 @@ class ComputeRescheduleOrReraiseTestCase(BaseTestCase):
         # instance shouldn't be rescheduled if unexpected task state arises.
         # the exception should get reraised.
         self.mox.StubOutWithMock(self.compute, '_spawn')
-        self.mox.StubOutWithMock(self.compute, '_reschedule_or_reraise')
+        self.mox.StubOutWithMock(self.compute, '_reschedule_or_error')
 
         exc = exception.UnexpectedTaskStateError(expected=task_states.SPAWNING,
                 actual=task_states.SCHEDULING)
@@ -8427,12 +8572,19 @@ class ComputeInjectedFilesTestCase(BaseTestCase):
             ('/d/e/f', base64.b64encode('seespotrun')),
         ]
 
-        def _ror(context, instance, exc_info, requested_networks,
+        def _roe(context, instance, exc_info, requested_networks,
                  admin_password, injected_files, is_first_time, request_spec,
                  filter_properties, bdms=None):
             self.assertEqual(expected, injected_files)
+            return True
 
-        self.stubs.Set(self.compute, '_reschedule_or_reraise', _ror)
+        def spawn_explode(context, instance, image_meta, injected_files,
+                admin_password, nw_info, block_device_info):
+            # force reschedule logic to execute
+            raise test.TestingException(_("spawn error"))
+
+        self.stubs.Set(self.compute.driver, 'spawn', spawn_explode)
+        self.stubs.Set(self.compute, '_reschedule_or_error', _roe)
 
         self.compute.run_instance(self.context, self.instance,
                                   injected_files=expected)
