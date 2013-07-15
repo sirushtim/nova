@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright 2010 United States Government as represented by the
@@ -24,9 +23,12 @@ import traceback
 
 from oslo.config import cfg
 
+from nova.conductor import rpcapi as conductor_rpcapi
 from nova import config
 import nova.db.api
 from nova import exception
+from nova import objects
+from nova.objects import base as objects_base
 from nova.openstack.common import log as logging
 from nova import service
 from nova import utils
@@ -51,12 +53,15 @@ def block_db_access():
 
 
 def main():
+    objects.register_all()
     config.parse_args(sys.argv)
     logging.setup('nova')
     utils.monkey_patch()
 
     if not CONF.conductor.use_local:
         block_db_access()
+        objects_base.NovaObject.indirection_api = \
+            conductor_rpcapi.ConductorAPI()
 
     server = service.Service.create(binary='nova-compute',
                                     topic=CONF.compute_topic,

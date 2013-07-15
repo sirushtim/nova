@@ -33,8 +33,8 @@ from nova.openstack.common import excutils
 from nova.openstack.common import fileutils
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
-from nova.openstack.common import lockutils
 from nova.openstack.common import log as logging
+from nova.openstack.common import processutils
 from nova.openstack.common import timeutils
 from nova import paths
 from nova import utils
@@ -396,7 +396,7 @@ class IptablesManager(object):
 
         self._apply()
 
-    @lockutils.synchronized('iptables', 'nova-', external=True)
+    @utils.synchronized('iptables', external=True)
     def _apply(self):
         """Apply the current in-memory set of iptables rules.
 
@@ -628,11 +628,12 @@ def metadata_accept():
 
 def add_snat_rule(ip_range):
     if CONF.routing_source_ip:
-        rule = '-s %s -j SNAT --to-source %s' % (ip_range,
-                                                 CONF.routing_source_ip)
-        if CONF.public_interface:
-            rule += ' -o %s' % CONF.public_interface
-        iptables_manager.ipv4['nat'].add_rule('snat', rule)
+        for dest_range in CONF.force_snat_range or ['0.0.0.0/0']:
+            rule = ('-s %s -d %s -j SNAT --to-source %s'
+                    % (ip_range, dest_range, CONF.routing_source_ip))
+            if CONF.public_interface:
+                rule += ' -o %s' % CONF.public_interface
+            iptables_manager.ipv4['nat'].add_rule('snat', rule)
         iptables_manager.apply()
 
 
@@ -764,7 +765,18 @@ def floating_forward_rules(floating_ip, fixed_ip, device):
             ('PREROUTING', '-d %s -j DNAT --to %s' % (floating_ip, fixed_ip)))
     rules.append(
             ('OUTPUT', '-d %s -j DNAT --to %s' % (floating_ip, fixed_ip)))
+    rules.append(('POSTROUTING', '-s %s -m conntrack --ctstate DNAT -j SNAT '
+                  '--to-source %s' %
+                  (fixed_ip, floating_ip)))
     return rules
+
+
+def clean_conntrack(fixed_ip):
+    try:
+        _execute('conntrack', '-D', '-r', fixed_ip, run_as_root=True,
+                 check_exit_code=[0, 1])
+    except processutils.ProcessExecutionError:
+        LOG.exception(_('Error deleting conntrack entries for %s'), fixed_ip)
 
 
 def initialize_gateway_device(dev, network_ref):
@@ -885,6 +897,8 @@ def _remove_dnsmasq_accept_rules(dev):
     iptables_manager.apply()
 
 
+# NOTE(russellb) Curious why this is needed?  Check out this explanation from
+# markmc: https://bugzilla.redhat.com/show_bug.cgi?id=910619#c6
 def _add_dhcp_mangle_rule(dev):
     if not os.path.exists('/dev/vhost-net'):
         return
@@ -971,7 +985,7 @@ def kill_dhcp(dev):
 # NOTE(ja): Sending a HUP only reloads the hostfile, so any
 #           configuration options (like dchp-range, vlan, ...)
 #           aren't reloaded.
-@lockutils.synchronized('dnsmasq_start', 'nova-')
+@utils.synchronized('dnsmasq_start')
 def restart_dhcp(context, dev, network_ref):
     """(Re)starts a dnsmasq server for a given network.
 
@@ -986,13 +1000,13 @@ def restart_dhcp(context, dev, network_ref):
         #             are not in multi_host mode.
         optsfile = _dhcp_file(dev, 'opts')
         write_to_file(optsfile, get_dhcp_opts(context, network_ref))
-        os.chmod(optsfile, 0644)
+        os.chmod(optsfile, 0o644)
 
     if network_ref['multi_host']:
         _add_dhcp_mangle_rule(dev)
 
     # Make sure dnsmasq can actually read it (it setuid()s to "nobody")
-    os.chmod(conffile, 0644)
+    os.chmod(conffile, 0o644)
 
     pid = _dnsmasq_pid_for(dev)
 
@@ -1046,7 +1060,7 @@ def restart_dhcp(context, dev, network_ref):
     if network_ref['multi_host'] or dns_servers:
         cmd.append('--no-hosts')
     if network_ref['multi_host']:
-        '--addn-hosts=%s' % _dhcp_file(dev, 'hosts')
+        cmd.append('--addn-hosts=%s' % _dhcp_file(dev, 'hosts'))
     if dns_servers:
         cmd.append('--no-resolv')
     for dns_server in dns_servers:
@@ -1059,7 +1073,7 @@ def restart_dhcp(context, dev, network_ref):
     _add_dnsmasq_accept_rules(dev)
 
 
-@lockutils.synchronized('radvd_start', 'nova-')
+@utils.synchronized('radvd_start')
 def update_ra(context, dev, network_ref):
     conffile = _ra_file(dev, 'conf')
     conf_str = """
@@ -1078,7 +1092,7 @@ interface %s
     write_to_file(conffile, conf_str)
 
     # Make sure radvd can actually read it (it setuid()s to "nobody")
-    os.chmod(conffile, 0644)
+    os.chmod(conffile, 0o644)
 
     pid = _ra_pid_for(dev)
 
@@ -1219,12 +1233,7 @@ def _create_veth_pair(dev1_name, dev2_name):
     deleting any previous devices with those names.
     """
     for dev in [dev1_name, dev2_name]:
-        if device_exists(dev):
-            try:
-                utils.execute('ip', 'link', 'delete', dev1_name,
-                              run_as_root=True, check_exit_code=[0, 2, 254])
-            except exception.ProcessExecutionError:
-                LOG.exception(_("Error clearing stale veth %s") % dev)
+        delete_net_dev(dev)
 
     utils.execute('ip', 'link', 'add', dev1_name, 'type', 'veth', 'peer',
                   'name', dev2_name, run_as_root=True)
@@ -1248,6 +1257,17 @@ def create_ovs_vif_port(bridge, dev, iface_id, mac, instance_id):
 def delete_ovs_vif_port(bridge, dev):
     utils.execute('ovs-vsctl', 'del-port', bridge, dev,
                   run_as_root=True)
+    delete_net_dev(dev)
+
+
+def create_ivs_vif_port(dev, iface_id, mac, instance_id):
+    utils.execute('ivs-ctl', 'add-port',
+                   dev, run_as_root=True)
+
+
+def delete_ivs_vif_port(dev):
+    utils.execute('ivs-ctl', 'del-port', dev,
+                  run_as_root=True)
     utils.execute('ip', 'link', 'delete', dev,
                   run_as_root=True)
 
@@ -1258,7 +1278,7 @@ def create_tap_dev(dev, mac_address=None):
             # First, try with 'ip'
             utils.execute('ip', 'tuntap', 'add', dev, 'mode', 'tap',
                           run_as_root=True, check_exit_code=[0, 2, 254])
-        except exception.ProcessExecutionError:
+        except processutils.ProcessExecutionError:
             # Second option: tunctl
             utils.execute('tunctl', '-b', '-t', dev, run_as_root=True)
         if mac_address:
@@ -1266,6 +1286,18 @@ def create_tap_dev(dev, mac_address=None):
                           run_as_root=True, check_exit_code=[0, 2, 254])
         utils.execute('ip', 'link', 'set', dev, 'up', run_as_root=True,
                       check_exit_code=[0, 2, 254])
+
+
+def delete_net_dev(dev):
+    """Delete a network device only if it exists."""
+    if device_exists(dev):
+        try:
+            utils.execute('ip', 'link', 'delete', dev, run_as_root=True,
+                          check_exit_code=[0, 2, 254])
+            LOG.debug(_("Net device removed: '%s'"), dev)
+        except processutils.ProcessExecutionError:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_("Failed removing net device: '%s'"), dev)
 
 
 # Similar to compute virt layers, the Linux network node
@@ -1378,7 +1410,7 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
         LinuxBridgeInterfaceDriver.remove_vlan(vlan_num)
 
     @classmethod
-    @lockutils.synchronized('lock_vlan', 'nova-', external=True)
+    @utils.synchronized('lock_vlan', external=True)
     def ensure_vlan(_self, vlan_num, bridge_interface, mac_address=None):
         """Create a vlan unless it already exists."""
         interface = 'vlan%s' % vlan_num
@@ -1403,24 +1435,14 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
         return interface
 
     @classmethod
-    @lockutils.synchronized('lock_vlan', 'nova-', external=True)
+    @utils.synchronized('lock_vlan', external=True)
     def remove_vlan(cls, vlan_num):
         """Delete a vlan."""
         vlan_interface = 'vlan%s' % vlan_num
-        if not device_exists(vlan_interface):
-            return
-        else:
-            try:
-                utils.execute('ip', 'link', 'delete', vlan_interface,
-                              run_as_root=True, check_exit_code=[0, 2, 254])
-            except exception.ProcessExecutionError:
-                with excutils.save_and_reraise_exception():
-                    LOG.error(_("Failed unplugging VLAN interface '%s'"),
-                              vlan_interface)
-            LOG.debug(_("Unplugged VLAN interface '%s'"), vlan_interface)
+        delete_net_dev(vlan_interface)
 
     @classmethod
-    @lockutils.synchronized('lock_bridge', 'nova-', external=True)
+    @utils.synchronized('lock_bridge', external=True)
     def ensure_bridge(_self, bridge, interface, net_attrs=None, gateway=True,
                       filtering=True):
         """Create a bridge unless it already exists.
@@ -1505,7 +1527,7 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
                                       % (bridge, CONF.iptables_drop_action)))
 
     @classmethod
-    @lockutils.synchronized('lock_bridge', 'nova-', external=True)
+    @utils.synchronized('lock_bridge', external=True)
     def remove_bridge(cls, bridge, gateway=True, filtering=True):
         """Delete a bridge."""
         if not device_exists(bridge):
@@ -1528,18 +1550,10 @@ class LinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
                         ipv4_filter.remove_rule('FORWARD',
                                                 ('--out-interface %s -j %s'
                                                  % (bridge, drop_action)))
-            try:
-                utils.execute('ip', 'link', 'delete', bridge, run_as_root=True,
-                              check_exit_code=[0, 2, 254])
-            except exception.ProcessExecutionError:
-                with excutils.save_and_reraise_exception():
-                    LOG.error(_("Failed unplugging bridge interface '%s'"),
-                              bridge)
-
-        LOG.debug(_("Unplugged bridge interface '%s'"), bridge)
+            delete_net_dev(bridge)
 
 
-@lockutils.synchronized('ebtables', 'nova-', external=True)
+@utils.synchronized('ebtables', external=True)
 def ensure_ebtables_rules(rules, table='filter'):
     for rule in rules:
         cmd = ['ebtables', '-t', table, '-D'] + rule.split()
@@ -1548,7 +1562,7 @@ def ensure_ebtables_rules(rules, table='filter'):
         _execute(*cmd, run_as_root=True)
 
 
-@lockutils.synchronized('ebtables', 'nova-', external=True)
+@utils.synchronized('ebtables', external=True)
 def remove_ebtables_rules(rules, table='filter'):
     for rule in rules:
         cmd = ['ebtables', '-t', table, '-D'] + rule.split()
@@ -1705,8 +1719,8 @@ class LinuxOVSInterfaceDriver(LinuxNetInterfaceDriver):
         return dev
 
 
-# plugs interfaces using Linux Bridge when using QuantumManager
-class QuantumLinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
+# plugs interfaces using Linux Bridge when using NeutronManager
+class NeutronLinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
 
     BRIDGE_NAME_PREFIX = 'brq'
     GATEWAY_INTERFACE_PREFIX = 'gw-'
@@ -1751,18 +1765,10 @@ class QuantumLinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
 
     def unplug(self, network):
         dev = self.get_dev(network)
-
         if not device_exists(dev):
             return None
         else:
-            try:
-                utils.execute('ip', 'link', 'delete', dev, run_as_root=True,
-                              check_exit_code=[0, 2, 254])
-            except exception.ProcessExecutionError:
-                with excutils.save_and_reraise_exception():
-                    LOG.error(_("Failed unplugging gateway interface '%s'"),
-                              dev)
-            LOG.debug(_("Unplugged gateway interface '%s'"), dev)
+            delete_net_dev(dev)
             return dev
 
     def get_dev(self, network):
@@ -1772,5 +1778,8 @@ class QuantumLinuxBridgeInterfaceDriver(LinuxNetInterfaceDriver):
     def get_bridge(self, network):
         bridge = self.BRIDGE_NAME_PREFIX + str(network['uuid'][0:11])
         return bridge
+
+# provide compatibility with existing configs
+QuantumLinuxBridgeInterfaceDriver = NeutronLinuxBridgeInterfaceDriver
 
 iptables_manager = IptablesManager()

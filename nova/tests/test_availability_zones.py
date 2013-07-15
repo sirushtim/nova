@@ -25,6 +25,7 @@ from nova import availability_zones as az
 from nova import context
 from nova import db
 from nova import test
+from nova.tests.api.openstack import fakes
 
 CONF = cfg.CONF
 CONF.import_opt('internal_service_availability_zone',
@@ -58,6 +59,10 @@ class AvailabilityZoneTestCases(test.TestCase):
 
         return agg
 
+    def _update_az(self, aggregate, az_name):
+        metadata = {'availability_zone': az_name}
+        db.aggregate_update(self.context, aggregate['id'], metadata)
+
     def _create_service_with_topic(self, topic, host, disabled=False):
         values = {
             'binary': 'bin',
@@ -76,7 +81,7 @@ class AvailabilityZoneTestCases(test.TestCase):
 
     def _delete_from_aggregate(self, service, aggregate):
         return db.aggregate_host_delete(self.context,
-                                        self.aggregate['id'], service['host'])
+                                        aggregate['id'], service['host'])
 
     def test_set_availability_zone_compute_service(self):
         """Test for compute service get right availability zone."""
@@ -118,6 +123,37 @@ class AvailabilityZoneTestCases(test.TestCase):
         self.assertEquals(self.availability_zone,
                         az.get_host_availability_zone(self.context, self.host))
 
+    def test_update_host_availability_zone(self):
+        """Test availability zone could be update by given host."""
+        service = self._create_service_with_topic('compute', self.host)
+
+        # Create a new aggregate with an AZ and add the host to the AZ
+        az_name = 'az1'
+        agg_az1 = self._create_az('agg-az1', az_name)
+        self._add_to_aggregate(service, agg_az1)
+        self.assertEquals(az_name,
+                    az.get_host_availability_zone(self.context, self.host))
+        # Update AZ
+        new_az_name = 'az2'
+        self._update_az(agg_az1, new_az_name)
+        self.assertEquals(new_az_name,
+                    az.get_host_availability_zone(self.context, self.host))
+
+    def test_delete_host_availability_zone(self):
+        """Test availability zone could be deleted successfully."""
+        service = self._create_service_with_topic('compute', self.host)
+
+        # Create a new aggregate with an AZ and add the host to the AZ
+        az_name = 'az1'
+        agg_az1 = self._create_az('agg-az1', az_name)
+        self._add_to_aggregate(service, agg_az1)
+        self.assertEquals(az_name,
+                    az.get_host_availability_zone(self.context, self.host))
+        # Delete the AZ via deleting the aggregate
+        self._delete_from_aggregate(service, agg_az1)
+        self.assertEquals(self.default_az,
+                    az.get_host_availability_zone(self.context, self.host))
+
     def test_get_availability_zones(self):
         """Test get_availability_zones."""
 
@@ -143,8 +179,8 @@ class AvailabilityZoneTestCases(test.TestCase):
                                                    disabled=False)
         service4 = self._create_service_with_topic('compute', 'host4',
                                                    disabled=True)
-        service5 = self._create_service_with_topic('compute', 'host5',
-                                                   disabled=True)
+        self._create_service_with_topic('compute', 'host5',
+                                        disabled=True)
 
         self._add_to_aggregate(service1, self.agg)
         self._add_to_aggregate(service2, self.agg)
@@ -155,3 +191,23 @@ class AvailabilityZoneTestCases(test.TestCase):
 
         self.assertEquals(zones, ['nova-test', 'nova-test2'])
         self.assertEquals(not_zones, ['nova-test3', 'nova'])
+
+    def test_get_instance_availability_zone_default_value(self):
+        """Test get right availability zone by given an instance."""
+        fake_inst_id = 162
+        fake_inst = fakes.stub_instance(fake_inst_id, host=self.host)
+
+        self.assertEqual(self.default_az,
+                az.get_instance_availability_zone(self.context, fake_inst))
+
+    def test_get_instance_availability_zone_from_aggregate(self):
+        """Test get availability zone from aggregate by given an instance."""
+        host = 'host170'
+        service = self._create_service_with_topic('compute', host)
+        self._add_to_aggregate(service, self.agg)
+
+        fake_inst_id = 174
+        fake_inst = fakes.stub_instance(fake_inst_id, host=host)
+
+        self.assertEqual(self.availability_zone,
+                az.get_instance_availability_zone(self.context, fake_inst))

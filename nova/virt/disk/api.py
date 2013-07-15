@@ -37,6 +37,7 @@ from oslo.config import cfg
 from nova import exception
 from nova.openstack.common import jsonutils
 from nova.openstack.common import log as logging
+from nova.openstack.common import processutils
 from nova import paths
 from nova import utils
 from nova.virt.disk.mount import api as mount
@@ -92,7 +93,7 @@ for s in CONF.virt_mkfs:
 
 def mkfs(os_type, fs_label, target):
     mkfs_command = (_MKFS_COMMAND.get(os_type, _DEFAULT_MKFS_COMMAND) or
-                    '') % locals()
+                    '') % {'fs_label': fs_label, 'target': target}
     if mkfs_command:
         utils.execute(*mkfs_command.split(), run_as_root=True)
 
@@ -130,7 +131,8 @@ def can_resize_fs(image, size, use_cow=False):
     """Check whether we can resize contained file system."""
 
     LOG.debug(_('Checking if we can resize image %(image)s. '
-                'size=%(size)s, CoW=%(use_cow)s'), locals())
+                'size=%(size)s, CoW=%(use_cow)s'),
+              {'image': image, 'size': size, 'use_cow': use_cow})
 
     # Check that we're increasing the size
     virt_size = get_disk_size(image)
@@ -155,7 +157,7 @@ def can_resize_fs(image, size, use_cow=False):
         # For raw, we can directly inspect the file system
         try:
             utils.execute('e2label', image)
-        except exception.ProcessExecutionError as e:
+        except processutils.ProcessExecutionError as e:
             LOG.debug(_('Unable to determine label for image %(image)s with '
                         'error %(errror)s. Cannot resize.'),
                       {'image': image,
@@ -280,9 +282,10 @@ def inject_data(image, key=None, net=None, metadata=None, admin_password=None,
     Raises an exception if a mandatory item can't be injected.
     """
     LOG.debug(_("Inject data image=%(image)s key=%(key)s net=%(net)s "
-                "metadata=%(metadata)s admin_password=ha-ha-not-telling-you "
-                "files=%(files)s partition=%(partition)s use_cow=%(use_cow)s")
-              % locals())
+                "metadata=%(metadata)s admin_password=<SANITIZED> "
+                "files=%(files)s partition=%(partition)s use_cow=%(use_cow)s"),
+              {'image': image, 'key': key, 'net': net, 'metadata': metadata,
+               'files': files, 'partition': partition, 'use_cow': use_cow})
     fmt = "raw"
     if use_cow:
         fmt = "qcow2"
@@ -297,7 +300,7 @@ def inject_data(image, key=None, net=None, metadata=None, admin_password=None,
             if inject_val:
                 raise
         LOG.warn(_('Ignoring error injecting data into image '
-                   '(%(e)s)') % locals())
+                   '(%(e)s)'), {'e': e})
         return False
 
     try:
@@ -316,7 +319,7 @@ def setup_container(image, container_dir, use_cow=False):
     img = _DiskImage(image=image, use_cow=use_cow, mount_dir=container_dir)
     if not img.mount():
         LOG.error(_("Failed to mount container filesystem '%(image)s' "
-                    "on '%(target)s': %(errors)s") %
+                    "on '%(target)s': %(errors)s"),
                   {"image": img, "target": container_dir,
                    "errors": img.errors})
         raise exception.NovaException(img.errors)
@@ -371,7 +374,7 @@ def inject_data_into_fs(fs, key, net, metadata, admin_password, files,
                 if inject in mandatory:
                     raise
                 LOG.warn(_('Ignoring error injecting %(inject)s into image '
-                           '(%(e)s)') % locals())
+                           '(%(e)s)'), {'e': e, 'inject': inject})
                 status = False
     return status
 
@@ -382,8 +385,8 @@ def _inject_files_into_fs(files, fs):
 
 
 def _inject_file_into_fs(fs, path, contents, append=False):
-    LOG.debug(_("Inject file fs=%(fs)s path=%(path)s append=%(append)s") %
-              locals())
+    LOG.debug(_("Inject file fs=%(fs)s path=%(path)s append=%(append)s"),
+              {'fs': fs, 'path': path, 'append': append})
     if append:
         fs.append_file(path, contents)
     else:
@@ -391,8 +394,8 @@ def _inject_file_into_fs(fs, path, contents, append=False):
 
 
 def _inject_metadata_into_fs(metadata, fs):
-    LOG.debug(_("Inject metadata fs=%(fs)s metadata=%(metadata)s") %
-              locals())
+    LOG.debug(_("Inject metadata fs=%(fs)s metadata=%(metadata)s"),
+              {'fs': fs, 'metadata': metadata})
     metadata = dict([(m['key'], m['value']) for m in metadata])
     _inject_file_into_fs(fs, 'meta.js', jsonutils.dumps(metadata))
 
@@ -422,7 +425,7 @@ def _setup_selinux_for_keys(fs, sshdir):
         restorecon.insert(0, '#!/bin/sh')
 
     _inject_file_into_fs(fs, rclocal, ''.join(restorecon), append=True)
-    fs.set_permissions(rclocal, 0700)
+    fs.set_permissions(rclocal, 0o700)
 
 
 def _inject_key_into_fs(key, fs):
@@ -432,12 +435,11 @@ def _inject_key_into_fs(key, fs):
     fs is the path to the base of the filesystem into which to inject the key.
     """
 
-    LOG.debug(_("Inject key fs=%(fs)s key=%(key)s") %
-              locals())
+    LOG.debug(_("Inject key fs=%(fs)s key=%(key)s"), {'fs': fs, 'key': key})
     sshdir = os.path.join('root', '.ssh')
     fs.make_path(sshdir)
     fs.set_ownership(sshdir, "root", "root")
-    fs.set_permissions(sshdir, 0700)
+    fs.set_permissions(sshdir, 0o700)
 
     keyfile = os.path.join(sshdir, 'authorized_keys')
 
@@ -450,7 +452,7 @@ def _inject_key_into_fs(key, fs):
     ])
 
     _inject_file_into_fs(fs, keyfile, key_data, append=True)
-    fs.set_permissions(keyfile, 0600)
+    fs.set_permissions(keyfile, 0o600)
 
     _setup_selinux_for_keys(fs, sshdir)
 
@@ -461,12 +463,11 @@ def _inject_net_into_fs(net, fs):
     net is the contents of /etc/network/interfaces.
     """
 
-    LOG.debug(_("Inject key fs=%(fs)s net=%(net)s") %
-              locals())
+    LOG.debug(_("Inject key fs=%(fs)s net=%(net)s"), {'fs': fs, 'net': net})
     netdir = os.path.join('etc', 'network')
     fs.make_path(netdir)
     fs.set_ownership(netdir, "root", "root")
-    fs.set_permissions(netdir, 0744)
+    fs.set_permissions(netdir, 0o744)
 
     netfile = os.path.join('etc', 'network', 'interfaces')
     _inject_file_into_fs(fs, netfile, net)
@@ -488,8 +489,7 @@ def _inject_admin_password_into_fs(admin_passwd, fs):
     # necessary changes, and then copy them back.
 
     LOG.debug(_("Inject admin password fs=%(fs)s "
-                "admin_passwd=ha-ha-not-telling-you") %
-              locals())
+                "admin_passwd=<SANITIZED>"), {'fs': fs})
     admin_user = 'root'
 
     fd, tmp_passwd = tempfile.mkstemp()

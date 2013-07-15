@@ -22,7 +22,7 @@ import urlparse
 
 from nova.api.openstack.compute import flavors
 from nova.api.openstack import xmlutil
-import nova.compute.instance_types
+import nova.compute.flavors
 from nova import context
 from nova import db
 from nova import exception
@@ -50,11 +50,11 @@ FAKE_FLAVORS = {
 }
 
 
-def fake_instance_type_get_by_flavor_id(flavorid):
+def fake_flavor_get_by_flavor_id(flavorid, ctxt=None):
     return FAKE_FLAVORS['flavor %s' % flavorid]
 
 
-def fake_instance_type_get_all(inactive=False, filters=None):
+def fake_flavor_get_all(inactive=False, filters=None):
     def reject_min(db_attr, filter_attr):
         return (filter_attr in filters and
                 int(flavor[db_attr]) < int(filters[filter_attr]))
@@ -72,11 +72,11 @@ def fake_instance_type_get_all(inactive=False, filters=None):
     return output
 
 
-def empty_instance_type_get_all(inactive=False, filters=None):
+def empty_flavor_get_all(inactive=False, filters=None):
     return {}
 
 
-def return_instance_type_not_found(flavor_id):
+def return_flavor_not_found(flavor_id, ctxt=None):
     raise exception.InstanceTypeNotFound(instance_type_id=flavor_id)
 
 
@@ -86,18 +86,18 @@ class FlavorsTest(test.TestCase):
         self.flags(osapi_compute_extension=[])
         fakes.stub_out_networking(self.stubs)
         fakes.stub_out_rate_limiting(self.stubs)
-        self.stubs.Set(nova.compute.instance_types, "get_all_types",
-                       fake_instance_type_get_all)
-        self.stubs.Set(nova.compute.instance_types,
-                       "get_instance_type_by_flavor_id",
-                       fake_instance_type_get_by_flavor_id)
+        self.stubs.Set(nova.compute.flavors, "get_all_flavors",
+                       fake_flavor_get_all)
+        self.stubs.Set(nova.compute.flavors,
+                       "get_flavor_by_flavor_id",
+                       fake_flavor_get_by_flavor_id)
 
         self.controller = flavors.Controller()
 
     def test_get_flavor_by_invalid_id(self):
-        self.stubs.Set(nova.compute.instance_types,
-                       "get_instance_type_by_flavor_id",
-                       return_instance_type_not_found)
+        self.stubs.Set(nova.compute.flavors,
+                       "get_flavor_by_flavor_id",
+                       return_flavor_not_found)
         req = fakes.HTTPRequest.blank('/v2/fake/flavors/asdf')
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.show, req, 'asdf')
@@ -341,8 +341,8 @@ class FlavorsTest(test.TestCase):
         self.assertEqual(flavor, expected)
 
     def test_get_empty_flavor_list(self):
-        self.stubs.Set(nova.compute.instance_types, "get_all_types",
-                       empty_instance_type_get_all)
+        self.stubs.Set(nova.compute.flavors, "get_all_flavors",
+                       empty_flavor_get_all)
 
         req = fakes.HTTPRequest.blank('/v2/fake/flavors')
         flavors = self.controller.index(req)
@@ -683,24 +683,23 @@ class DisabledFlavorsWithRealDBTest(test.TestCase):
         super(DisabledFlavorsWithRealDBTest, self).setUp()
         self.controller = flavors.Controller()
 
-        # Add a new disabled type to the list of instance_types/flavors
+        # Add a new disabled type to the list of flavors
         self.req = fakes.HTTPRequest.blank('/v2/fake/flavors')
         self.context = self.req.environ['nova.context']
         self.admin_context = context.get_admin_context()
 
         self.disabled_type = self._create_disabled_instance_type()
-        self.inst_types = db.api.instance_type_get_all(
+        self.inst_types = db.instance_type_get_all(
                 self.admin_context)
 
     def tearDown(self):
-        db.api.instance_type_destroy(
+        db.instance_type_destroy(
                 self.admin_context, self.disabled_type['name'])
 
         super(DisabledFlavorsWithRealDBTest, self).tearDown()
 
     def _create_disabled_instance_type(self):
-        inst_types = db.api.instance_type_get_all(
-                self.admin_context)
+        inst_types = db.instance_type_get_all(self.admin_context)
 
         inst_type = inst_types[0]
 
@@ -710,7 +709,7 @@ class DisabledFlavorsWithRealDBTest(test.TestCase):
                 [int(flavor['flavorid']) for flavor in inst_types]) + 1)
         inst_type['disabled'] = True
 
-        disabled_type = db.api.instance_type_create(
+        disabled_type = db.instance_type_create(
                 self.admin_context, inst_type)
 
         return disabled_type
@@ -762,3 +761,38 @@ class DisabledFlavorsWithRealDBTest(test.TestCase):
                 self.req, self.disabled_type['flavorid'])['flavor']
 
         self.assertEqual(flavor['name'], self.disabled_type['name'])
+
+
+class ParseIsPublicTest(test.TestCase):
+    def setUp(self):
+        super(ParseIsPublicTest, self).setUp()
+        self.controller = flavors.Controller()
+
+    def assertPublic(self, expected, is_public):
+        self.assertIs(expected, self.controller._parse_is_public(is_public),
+                      '%s did not return %s' % (is_public, expected))
+
+    def test_None(self):
+        self.assertPublic(True, None)
+
+    def test_truthy(self):
+        self.assertPublic(True, True)
+        self.assertPublic(True, 't')
+        self.assertPublic(True, 'true')
+        self.assertPublic(True, 'yes')
+        self.assertPublic(True, '1')
+
+    def test_falsey(self):
+        self.assertPublic(False, False)
+        self.assertPublic(False, 'f')
+        self.assertPublic(False, 'false')
+        self.assertPublic(False, 'no')
+        self.assertPublic(False, '0')
+
+    def test_string_none(self):
+        self.assertPublic(None, 'none')
+        self.assertPublic(None, 'None')
+
+    def test_other(self):
+        self.assertRaises(
+                webob.exc.HTTPBadRequest, self.assertPublic, None, 'other')

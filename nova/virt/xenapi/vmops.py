@@ -19,21 +19,23 @@
 Management class for VM-related functions (spawn, reboot, etc).
 """
 
+import base64
 import functools
 import itertools
 import time
+import zlib
 
 from eventlet import greenthread
 import netaddr
 from oslo.config import cfg
 
 from nova import block_device
-from nova.compute import api as compute
-from nova.compute import instance_types
+from nova.compute import flavors
 from nova.compute import power_state
 from nova.compute import task_states
 from nova.compute import vm_mode
 from nova.compute import vm_states
+from nova import conductor
 from nova import context as nova_context
 from nova import exception
 from nova.openstack.common import excutils
@@ -85,6 +87,10 @@ DEVICE_CONFIGDRIVE = '3'
 # Note(johngarbutt) HVM guests only support four devices
 # until the PV tools activate, when others before available
 # As such, ephemeral disk only available once PV tools load
+# Note(johngarbutt) When very large ephemeral storage is required,
+# multiple disks may be added. In this case the device id below
+# is the used for the first disk. The second disk will be given
+# next device id, i.e. 5, and so on, until enough space is added.
 DEVICE_EPHEMERAL = '4'
 # Note(johngarbutt) Currently don't support ISO boot during rescue
 # and we must have the ISO visible before the PV drivers start
@@ -136,8 +142,7 @@ def make_step_decorator(context, instance, instance_update):
         step_info['current'] += 1
         progress = round(float(step_info['current']) /
                          step_info['total'] * 100)
-        LOG.debug(_("Updating progress to %(progress)d"), locals(),
-                  instance=instance)
+        LOG.debug(_("Updating progress to %d"), progress, instance=instance)
         instance_update(context, instance['uuid'], {'progress': progress})
 
     def step_decorator(f):
@@ -159,7 +164,7 @@ class VMOps(object):
     Management class for VM-related tasks
     """
     def __init__(self, session, virtapi):
-        self.compute_api = compute.API()
+        self.conductor_api = conductor.API()
         self._session = session
         self._virtapi = virtapi
         self._volumeops = volumeops.VolumeOps(self._session)
@@ -171,17 +176,19 @@ class VMOps(object):
         self.vif_driver = vif_impl(xenapi_session=self._session)
         self.default_root_dev = '/dev/sda'
 
-        msg = _("Importing image upload handler: %s")
-        LOG.debug(msg % CONF.xenapi_image_upload_handler)
+        LOG.debug(_("Importing image upload handler: %s"),
+                  CONF.xenapi_image_upload_handler)
         self.image_upload_handler = importutils.import_object(
                                 CONF.xenapi_image_upload_handler)
 
-    @property
-    def agent_enabled(self):
-        return not CONF.xenapi_disable_agent
+    def agent_enabled(self, instance):
+        if CONF.xenapi_disable_agent:
+            return False
+
+        return xapi_agent.should_use_agent(instance)
 
     def _get_agent(self, instance, vm_ref):
-        if self.agent_enabled:
+        if self.agent_enabled(instance):
             return xapi_agent.XenAPIBasedAgent(self._session, self._virtapi,
                                                instance, vm_ref)
         raise exception.NovaException(_("Error: Agent is disabled"))
@@ -209,6 +216,9 @@ class VMOps(object):
         return nova_uuids
 
     def confirm_migration(self, migration, instance, network_info):
+        self._destroy_orig_vm(instance, network_info)
+
+    def _destroy_orig_vm(self, instance, network_info):
         name_label = self._get_orig_vm_name_label(instance)
         vm_ref = vm_utils.lookup(self._session, name_label)
         return self._destroy(instance, vm_ref, network_info=network_info)
@@ -226,7 +236,13 @@ class VMOps(object):
                                           mount_device,
                                           hotplug=False)
 
-    def finish_revert_migration(self, instance, block_device_info=None):
+    def finish_revert_migration(self, instance, block_device_info=None,
+                                power_on=True):
+        self._restore_orig_vm_and_cleanup_orphan(instance, block_device_info,
+                                                 power_on)
+
+    def _restore_orig_vm_and_cleanup_orphan(self, instance,
+                                            block_device_info, power_on=True):
         # NOTE(sirp): the original vm was suffixed with '-orig'; find it using
         # the old suffix, remove the suffix, then power it back on.
         name_label = self._get_orig_vm_name_label(instance)
@@ -249,11 +265,12 @@ class VMOps(object):
             # We crashed before the -orig backup was made
             vm_ref = new_ref
 
-        self._start(instance, vm_ref)
+        if power_on:
+            self._start(instance, vm_ref)
 
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance,
-                         block_device_info=None):
+                         block_device_info=None, power_on=True):
         root_vdi = vm_utils.move_disks(self._session, instance, disk_info)
 
         if resize_instance:
@@ -284,7 +301,8 @@ class VMOps(object):
         self._attach_mapped_block_devices(instance, block_device_info)
 
         # 5. Start VM
-        self._start(instance, vm_ref=vm_ref)
+        if power_on:
+            self._start(instance, vm_ref=vm_ref)
         self._update_instance_progress(context, instance,
                                        step=5,
                                        total_steps=RESIZE_TOTAL_STEPS)
@@ -495,11 +513,7 @@ class VMOps(object):
                 disk_image_type)
         self._setup_vm_networking(instance, vm_ref, vdis, network_info,
                 rescue)
-
-        # NOTE(mikal): file injection only happens if we are _not_ using a
-        # configdrive.
-        if not configdrive.required_by(instance):
-            self.inject_instance_metadata(instance, vm_ref)
+        self.inject_instance_metadata(instance, vm_ref)
 
         return vm_ref
 
@@ -564,7 +578,7 @@ class VMOps(object):
     def _attach_disks(self, instance, vm_ref, name_label, vdis,
                       disk_image_type, admin_password=None, files=None):
         ctx = nova_context.get_admin_context()
-        instance_type = instance_types.extract_instance_type(instance)
+        instance_type = flavors.extract_flavor(instance)
 
         # Attach (required) root disk
         if disk_image_type == vm_utils.ImageType.DISK_ISO:
@@ -583,9 +597,9 @@ class VMOps(object):
             if instance['auto_disk_config']:
                 LOG.debug(_("Auto configuring disk, attempting to "
                             "resize partition..."), instance=instance)
-                vm_utils.auto_configure_disk(self._session,
-                                             root_vdi['ref'],
-                                             instance_type['root_gb'])
+                vm_utils.try_auto_configure_disk(self._session,
+                                                 root_vdi['ref'],
+                                                 instance_type['root_gb'])
 
             vm_utils.create_vbd(self._session, vm_ref, root_vdi['ref'],
                                 DEVICE_ROOT, bootable=True,
@@ -643,7 +657,7 @@ class VMOps(object):
 
             greenthread.sleep(0.5)
 
-        if self.agent_enabled:
+        if self.agent_enabled(instance):
             agent_build = self._virtapi.agent_build_get_by_triple(
                 ctx, 'xen', instance['os_type'], instance['architecture'])
             if agent_build:
@@ -665,7 +679,7 @@ class VMOps(object):
                          instance=instance)
 
             if (version and agent_build and
-                cmp_version(version, agent_build['version']) < 0):
+                    cmp_version(version, agent_build['version']) < 0):
                 agent.agent_update(agent_build)
 
             # if the guest agent is not available, configure the
@@ -689,7 +703,7 @@ class VMOps(object):
             agent.resetnetwork()
 
         # Set VCPU weight
-        instance_type = instance_types.extract_instance_type(instance)
+        instance_type = flavors.extract_flavor(instance)
         vcpu_weight = instance_type['vcpu_weight']
         if vcpu_weight is not None:
             LOG.debug(_("Setting VCPU weight"), instance=instance)
@@ -766,7 +780,8 @@ class VMOps(object):
 
     def _migrate_vhd(self, instance, vdi_uuid, dest, sr_path, seq_num):
         LOG.debug(_("Migrating VHD '%(vdi_uuid)s' with seq_num %(seq_num)d"),
-                  locals(), instance=instance)
+                  {'vdi_uuid': vdi_uuid, 'seq_num': seq_num},
+                  instance=instance)
         instance_uuid = instance['uuid']
         try:
             self._session.call_plugin_serialized('migration', 'transfer_vhd',
@@ -792,58 +807,85 @@ class VMOps(object):
         # better approximation would use the percentage of the VM image that
         # has been streamed to the destination host.
         progress = round(float(step) / total_steps * 100)
-        LOG.debug(_("Updating progress to %(progress)d"), locals(),
+        LOG.debug(_("Updating progress to %d"), progress,
                   instance=instance)
         self._virtapi.instance_update(context, instance['uuid'],
                                       {'progress': progress})
 
-    def _migrate_disk_resizing_down(self, context, instance, dest,
-                                    instance_type, vm_ref, sr_path):
-        # 1. NOOP since we're not transmitting the base-copy separately
-        self._update_instance_progress(context, instance,
-                                       step=1,
-                                       total_steps=RESIZE_TOTAL_STEPS)
+    def _resize_ensure_vm_is_shutdown(self, instance, vm_ref):
+        if vm_utils.is_vm_shutdown(self._session, vm_ref):
+            LOG.debug(_("VM was already shutdown."), instance=instance)
+            return
 
-        vdi_ref, vm_vdi_rec = vm_utils.get_vdi_for_vm_safely(
-                self._session, vm_ref)
-        vdi_uuid = vm_vdi_rec['uuid']
-
-        old_gb = instance['root_gb']
-        new_gb = instance_type['root_gb']
-        LOG.debug(_("Resizing down VDI %(vdi_uuid)s from "
-                    "%(old_gb)dGB to %(new_gb)dGB"), locals(),
-                  instance=instance)
-
-        # 2. Power down the instance before resizing
         if not vm_utils.clean_shutdown_vm(self._session, instance, vm_ref):
             LOG.debug(_("Clean shutdown did not complete successfully, "
                         "trying hard shutdown."), instance=instance)
-            vm_utils.hard_shutdown_vm(self._session, instance, vm_ref)
-        self._update_instance_progress(context, instance,
-                                       step=2,
-                                       total_steps=RESIZE_TOTAL_STEPS)
+            if not vm_utils.hard_shutdown_vm(self._session, instance, vm_ref):
+                raise exception.ResizeError(
+                    reason=_("Unable to terminate instance."))
 
-        # 3. Copy VDI, resize partition and filesystem, forget VDI,
-        # truncate VHD
-        new_ref, new_uuid = vm_utils.resize_disk(self._session,
-                                                 instance,
-                                                 vdi_ref,
-                                                 instance_type)
-        self._update_instance_progress(context, instance,
-                                       step=3,
-                                       total_steps=RESIZE_TOTAL_STEPS)
+    def _migrate_disk_resizing_down(self, context, instance, dest,
+                                    instance_type, vm_ref, sr_path):
+        step = make_step_decorator(context, instance,
+                                   self._virtapi.instance_update)
 
-        # 4. Transfer the new VHD
-        self._migrate_vhd(instance, new_uuid, dest, sr_path, 0)
-        self._update_instance_progress(context, instance,
-                                       step=4,
-                                       total_steps=RESIZE_TOTAL_STEPS)
+        @step
+        def fake_step_to_match_resizing_up():
+            pass
 
-        # Clean up VDI now that it's been copied
-        vm_utils.destroy_vdi(self._session, new_ref)
+        @step
+        def rename_and_power_off_vm(undo_mgr):
+            self._resize_ensure_vm_is_shutdown(instance, vm_ref)
+            self._apply_orig_vm_name_label(instance, vm_ref)
+
+            def restore_orig_vm():
+                # Do not need to restore block devices, not yet been removed
+                self._restore_orig_vm_and_cleanup_orphan(instance, None)
+
+            undo_mgr.undo_with(restore_orig_vm)
+
+        @step
+        def create_copy_vdi_and_resize(undo_mgr, old_vdi_ref):
+            new_vdi_ref, new_vdi_uuid = vm_utils.resize_disk(self._session,
+                instance, old_vdi_ref, instance_type)
+
+            def cleanup_vdi_copy():
+                vm_utils.destroy_vdi(self._session, new_vdi_ref)
+
+            undo_mgr.undo_with(cleanup_vdi_copy)
+
+            return new_vdi_ref, new_vdi_uuid
+
+        @step
+        def transfer_vhd_to_dest(new_vdi_ref, new_vdi_uuid):
+            self._migrate_vhd(instance, new_vdi_uuid, dest, sr_path, 0)
+            # Clean up VDI now that it's been copied
+            vm_utils.destroy_vdi(self._session, new_vdi_ref)
+
+        @step
+        def fake_step_to_be_executed_by_finish_migration():
+            pass
+
+        undo_mgr = utils.UndoManager()
+        try:
+            fake_step_to_match_resizing_up()
+            rename_and_power_off_vm(undo_mgr)
+            old_vdi_ref, _ignore = vm_utils.get_vdi_for_vm_safely(
+                self._session, vm_ref)
+            new_vdi_ref, new_vdi_uuid = create_copy_vdi_and_resize(
+                undo_mgr, old_vdi_ref)
+            transfer_vhd_to_dest(new_vdi_ref, new_vdi_uuid)
+        except Exception as error:
+            LOG.exception(_("_migrate_disk_resizing_down failed. "
+                            "Restoring orig vm due_to: %s."), error,
+                          instance=instance)
+            undo_mgr._rollback()
+            raise exception.InstanceFaultRollback(error)
 
     def _migrate_disk_resizing_up(self, context, instance, dest, vm_ref,
                                   sr_path):
+        self._apply_orig_vm_name_label(instance, vm_ref)
+
         # 1. Create Snapshot
         label = "%s-snapshot" % instance['name']
         with vm_utils.snapshot_attached_here(
@@ -864,26 +906,30 @@ class VMOps(object):
                                                step=2,
                                                total_steps=RESIZE_TOTAL_STEPS)
 
-        # 3. Now power down the instance
-        if not vm_utils.clean_shutdown_vm(self._session, instance, vm_ref):
-            LOG.debug(_("Clean shutdown did not complete successfully, "
-                        "trying hard shutdown."), instance=instance)
-            vm_utils.hard_shutdown_vm(self._session, instance, vm_ref)
-        self._update_instance_progress(context, instance,
-                                       step=3,
-                                       total_steps=RESIZE_TOTAL_STEPS)
+            # 3. Now power down the instance
+            self._resize_ensure_vm_is_shutdown(instance, vm_ref)
+            self._update_instance_progress(context, instance,
+                                           step=3,
+                                           total_steps=RESIZE_TOTAL_STEPS)
 
-        # 4. Transfer the COW VHD
-        vdi_ref, vm_vdi_rec = vm_utils.get_vdi_for_vm_safely(
+            # 4. Transfer the COW VHD
+            vdi_ref, vm_vdi_rec = vm_utils.get_vdi_for_vm_safely(
                 self._session, vm_ref)
-        cow_uuid = vm_vdi_rec['uuid']
-        self._migrate_vhd(instance, cow_uuid, dest, sr_path, 0)
-        self._update_instance_progress(context, instance,
-                                       step=4,
-                                       total_steps=RESIZE_TOTAL_STEPS)
+            cow_uuid = vm_vdi_rec['uuid']
+            self._migrate_vhd(instance, cow_uuid, dest, sr_path, 0)
+            self._update_instance_progress(context, instance,
+                                           step=4,
+                                           total_steps=RESIZE_TOTAL_STEPS)
+
+    def _apply_orig_vm_name_label(self, instance, vm_ref):
+        # NOTE(sirp): in case we're resizing to the same host (for dev
+        # purposes), apply a suffix to name-label so the two VM records
+        # extant until a confirm_resize don't collide.
+        name_label = self._get_orig_vm_name_label(instance)
+        vm_utils.set_vm_name_label(self._session, vm_ref, name_label)
 
     def migrate_disk_and_power_off(self, context, instance, dest,
-                                   instance_type):
+                                   instance_type, block_device_info):
         """Copies a VHD from one host machine to another, possibly
         resizing filesystem before hand.
 
@@ -891,23 +937,17 @@ class VMOps(object):
         :param dest: the destination host machine.
         :param instance_type: instance_type to resize to
         """
-        vm_ref = self._get_vm_opaque_ref(instance)
-        sr_path = vm_utils.get_sr_path(self._session)
-        resize_down = instance['root_gb'] > instance_type['root_gb']
-        if resize_down and not instance['auto_disk_config']:
-            reason = _('Resize down not allowed without auto_disk_config')
-            raise exception.ResizeError(reason=reason)
-
         # 0. Zero out the progress to begin
         self._update_instance_progress(context, instance,
                                        step=0,
                                        total_steps=RESIZE_TOTAL_STEPS)
 
-        # NOTE(sirp): in case we're resizing to the same host (for dev
-        # purposes), apply a suffix to name-label so the two VM records
-        # extant until a confirm_resize don't collide.
-        name_label = self._get_orig_vm_name_label(instance)
-        vm_utils.set_vm_name_label(self._session, vm_ref, name_label)
+        vm_ref = self._get_vm_opaque_ref(instance)
+        sr_path = vm_utils.get_sr_path(self._session)
+
+        old_gb = instance['root_gb']
+        new_gb = instance_type['root_gb']
+        resize_down = old_gb > new_gb
 
         if resize_down:
             self._migrate_disk_resizing_down(
@@ -916,11 +956,23 @@ class VMOps(object):
             self._migrate_disk_resizing_up(
                     context, instance, dest, vm_ref, sr_path)
 
+        self._detach_block_devices_from_orig_vm(instance, block_device_info)
+
         # NOTE(sirp): disk_info isn't used by the xenapi driver, instead it
         # uses a staging-area (/images/instance<uuid>) and sequence-numbered
         # VHDs to figure out how to reconstruct the VDI chain after syncing
         disk_info = {}
         return disk_info
+
+    def _detach_block_devices_from_orig_vm(self, instance, block_device_info):
+        block_device_mapping = virt_driver.block_device_info_get_mapping(
+                block_device_info)
+        name_label = self._get_orig_vm_name_label(instance)
+        for vol in block_device_mapping:
+            connection_info = vol['connection_info']
+            mount_device = vol['mount_device'].rpartition("/")[2]
+            self._volumeops.detach_volume(connection_info, name_label,
+                                          mount_device)
 
     def _resize_instance(self, instance, root_vdi):
         """Resize an instances root disk."""
@@ -941,7 +993,9 @@ class VMOps(object):
             # Resize up. Simple VDI resize will do the trick
             vdi_uuid = root_vdi['uuid']
             LOG.debug(_("Resizing up VDI %(vdi_uuid)s from %(old_gb)dGB to "
-                        "%(new_gb)dGB"), locals(), instance=instance)
+                        "%(new_gb)dGB"),
+                      {'vdi_uuid': vdi_uuid, 'old_gb': old_gb,
+                       'new_gb': new_gb}, instance=instance)
             resize_func_name = self.check_resize_func_name()
             self._session.call_xenapi(resize_func_name, root_vdi['ref'],
                     str(new_disk_size))
@@ -949,7 +1003,8 @@ class VMOps(object):
 
     def check_resize_func_name(self):
         """Check the function name used to resize an instance based
-        on product_brand and product_version."""
+        on product_brand and product_version.
+        """
 
         brand = self._session.product_brand
         version = self._session.product_version
@@ -1006,7 +1061,7 @@ class VMOps(object):
 
     def set_admin_password(self, instance, new_pass):
         """Set the root/admin password on the VM instance."""
-        if self.agent_enabled:
+        if self.agent_enabled(instance):
             vm_ref = self._get_vm_opaque_ref(instance)
             agent = self._get_agent(instance, vm_ref)
             agent.set_admin_password(new_pass)
@@ -1015,7 +1070,7 @@ class VMOps(object):
 
     def inject_file(self, instance, path, contents):
         """Write a file to the VM instance."""
-        if self.agent_enabled:
+        if self.agent_enabled(instance):
             vm_ref = self._get_vm_opaque_ref(instance)
             agent = self._get_agent(instance, vm_ref)
             agent.inject_file(path, contents)
@@ -1043,6 +1098,7 @@ class VMOps(object):
 
     def inject_instance_metadata(self, instance, vm_ref):
         """Inject instance metadata into xenstore."""
+        @utils.synchronized('xenstore-' + instance['uuid'])
         def store_meta(topdir, data_list):
             for item in data_list:
                 key = self._sanitize_xenstore_key(item['key'])
@@ -1056,9 +1112,8 @@ class VMOps(object):
     def change_instance_metadata(self, instance, diff):
         """Apply changes to instance metadata to xenstore."""
         vm_ref = self._get_vm_opaque_ref(instance)
-        for key, change in diff.items():
-            key = self._sanitize_xenstore_key(key)
-            location = 'vm-data/user-metadata/%s' % key
+
+        def process_change(location, change):
             if change[0] == '-':
                 self._remove_from_param_xenstore(vm_ref, location)
                 try:
@@ -1076,6 +1131,14 @@ class VMOps(object):
                 except KeyError:
                     # catch KeyError for domid if instance isn't running
                     pass
+
+        @utils.synchronized('xenstore-' + instance['uuid'])
+        def update_meta():
+            for key, change in diff.items():
+                key = self._sanitize_xenstore_key(key)
+                location = 'vm-data/user-metadata/%s' % key
+                process_change(location, change)
+        update_meta()
 
     def _find_root_vdi_ref(self, vm_ref):
         """Find and return the root vdi ref for a VM."""
@@ -1329,7 +1392,7 @@ class VMOps(object):
 
         for instance in instances:
             LOG.info(_("Automatically hard rebooting"), instance=instance)
-            self.compute_api.reboot(ctxt, instance, "HARD")
+            self.conductor_api.compute_reboot(ctxt, instance, "HARD")
 
     def get_info(self, instance, vm_ref=None):
         """Return data about VM instance."""
@@ -1352,7 +1415,8 @@ class VMOps(object):
 
     def get_all_bw_counters(self):
         """Return running bandwidth counter for each interface on each
-           running VM"""
+           running VM.
+        """
         counters = vm_utils.fetch_bandwidth(self._session)
         bw = {}
         for vm_ref, vm_rec in vm_utils.list_vms(self._session):
@@ -1371,9 +1435,18 @@ class VMOps(object):
         return bw
 
     def get_console_output(self, instance):
-        """Return snapshot of console."""
-        # TODO(armando-migliaccio): implement this to fix pylint!
-        return 'FAKE CONSOLE OUTPUT of instance'
+        """Return last few lines of instance console."""
+        dom_id = self._get_dom_id(instance, check_rescue=True)
+
+        try:
+            raw_console_data = self._session.call_plugin('console',
+                    'get_console_log', {'dom_id': dom_id})
+        except self._session.XenAPI.Failure as exc:
+            LOG.exception(exc)
+            msg = _("Guest does not have a console available")
+            raise exception.NovaException(msg)
+
+        return zlib.decompress(base64.b64decode(raw_console_data))
 
     def get_vnc_console(self, instance):
         """Return connection info for a vnc console."""
@@ -1470,19 +1543,22 @@ class VMOps(object):
         vm_ref = vm_ref or self._get_vm_opaque_ref(instance)
         LOG.debug(_("Injecting network info to xenstore"), instance=instance)
 
-        for vif in network_info:
-            xs_data = self._vif_xenstore_data(vif)
-            location = ('vm-data/networking/%s' %
-                        vif['address'].replace(':', ''))
-            self._add_to_param_xenstore(vm_ref,
-                                        location,
-                                        jsonutils.dumps(xs_data))
-            try:
-                self._write_to_xenstore(instance, location, xs_data,
-                                        vm_ref=vm_ref)
-            except KeyError:
-                # catch KeyError for domid if instance isn't running
-                pass
+        @utils.synchronized('xenstore-' + instance['uuid'])
+        def update_nwinfo():
+            for vif in network_info:
+                xs_data = self._vif_xenstore_data(vif)
+                location = ('vm-data/networking/%s' %
+                            vif['address'].replace(':', ''))
+                self._add_to_param_xenstore(vm_ref,
+                                            location,
+                                            jsonutils.dumps(xs_data))
+                try:
+                    self._write_to_xenstore(instance, location, xs_data,
+                                            vm_ref=vm_ref)
+                except KeyError:
+                    # catch KeyError for domid if instance isn't running
+                    pass
+        update_nwinfo()
 
     def _create_vifs(self, vm_ref, instance, network_info):
         """Creates vifs for an instance."""
@@ -1496,11 +1572,12 @@ class VMOps(object):
             vif_rec = self.vif_driver.plug(instance, vif,
                                            vm_ref=vm_ref, device=device)
             network_ref = vif_rec['network']
-            LOG.debug(_('Creating VIF for network %(network_ref)s'),
-                      locals(), instance=instance)
+            LOG.debug(_('Creating VIF for network %s'),
+                      network_ref, instance=instance)
             vif_ref = self._session.call_xenapi('VIF.create', vif_rec)
             LOG.debug(_('Created VIF %(vif_ref)s, network %(network_ref)s'),
-                      locals(), instance=instance)
+                      {'vif_ref': vif_ref, 'network_ref': network_ref},
+                      instance=instance)
 
     def plug_vifs(self, instance, network_info):
         """Set up VIF networking on the host."""
@@ -1514,7 +1591,7 @@ class VMOps(object):
 
     def reset_network(self, instance):
         """Calls resetnetwork method in agent."""
-        if self.agent_enabled:
+        if self.agent_enabled(instance):
             vm_ref = self._get_vm_opaque_ref(instance)
             agent = self._get_agent(instance, vm_ref)
             agent.resetnetwork()
@@ -1549,15 +1626,15 @@ class VMOps(object):
         return self._make_plugin_call('xenstore.py', 'delete_record', instance,
                                       vm_ref=vm_ref, path=path)
 
-    def _make_plugin_call(self, plugin, method, instance, vm_ref=None,
+    def _make_plugin_call(self, plugin, method, instance=None, vm_ref=None,
                           **addl_args):
         """
         Abstracts out the process of calling a method of a xenapi plugin.
         Any errors raised by the plugin will in turn raise a RuntimeError here.
         """
-        vm_ref = vm_ref or self._get_vm_opaque_ref(instance)
-        vm_rec = self._session.call_xenapi("VM.get_record", vm_ref)
-        args = {'dom_id': vm_rec['domid']}
+        args = {}
+        if instance or vm_ref:
+            args['dom_id'] = self._get_dom_id(instance, vm_ref)
         args.update(addl_args)
         try:
             return self._session.call_plugin(plugin, method, args)
@@ -1565,18 +1642,26 @@ class VMOps(object):
             err_msg = e.details[-1].splitlines()[-1]
             if 'TIMEOUT:' in err_msg:
                 LOG.error(_('TIMEOUT: The call to %(method)s timed out. '
-                            'args=%(args)r'), locals(), instance=instance)
+                            'args=%(args)r'),
+                          {'method': method, 'args': args}, instance=instance)
                 return {'returncode': 'timeout', 'message': err_msg}
             elif 'NOT IMPLEMENTED:' in err_msg:
                 LOG.error(_('NOT IMPLEMENTED: The call to %(method)s is not'
                             ' supported by the agent. args=%(args)r'),
-                          locals(), instance=instance)
+                          {'method': method, 'args': args}, instance=instance)
                 return {'returncode': 'notimplemented', 'message': err_msg}
             else:
                 LOG.error(_('The call to %(method)s returned an error: %(e)s. '
-                            'args=%(args)r'), locals(), instance=instance)
+                            'args=%(args)r'),
+                          {'method': method, 'args': args, 'e': e},
+                          instance=instance)
                 return {'returncode': 'error', 'message': err_msg}
             return None
+
+    def _get_dom_id(self, instance=None, vm_ref=None, check_rescue=False):
+        vm_ref = vm_ref or self._get_vm_opaque_ref(instance, check_rescue)
+        vm_rec = self._session.call_xenapi("VM.get_record", vm_ref)
+        return vm_rec['domid']
 
     def _add_to_param_xenstore(self, vm_ref, key, val):
         """
@@ -1623,9 +1708,9 @@ class VMOps(object):
         try:
             return current_aggregate.metadetails[hostname]
         except KeyError:
-            reason = _('Destination host:%(hostname)s must be in the same '
-                       'aggregate as the source server')
-            raise exception.MigrationError(reason=reason % locals())
+            reason = _('Destination host:%s must be in the same '
+                       'aggregate as the source server') % hostname
+            raise exception.MigrationPreCheckError(reason=reason)
 
     def _ensure_host_in_aggregate(self, context, hostname):
         self._get_host_uuid_from_aggregate(context, hostname)
@@ -1644,7 +1729,8 @@ class VMOps(object):
         pifs = self._session.call_xenapi('PIF.get_all_records_where',
                                          expr)
         if len(pifs) != 1:
-            raise exception.MigrationError('No suitable network for migrate')
+            msg = _('No suitable network for migrate')
+            raise exception.MigrationPreCheckError(reason=msg)
 
         nwref = pifs[pifs.keys()[0]]['network']
         try:
@@ -1655,8 +1741,24 @@ class VMOps(object):
                                                      options)
         except self._session.XenAPI.Failure as exc:
             LOG.exception(exc)
-            raise exception.MigrationError(_('Migrate Receive failed'))
+            msg = _('Migrate Receive failed')
+            raise exception.MigrationPreCheckError(reason=msg)
         return migrate_data
+
+    def _get_iscsi_srs(self, ctxt, instance_ref):
+        vm_ref = self._get_vm_opaque_ref(instance_ref)
+        vbd_refs = self._session.call_xenapi("VM.get_VBDs", vm_ref)
+
+        iscsi_srs = []
+
+        for vbd_ref in vbd_refs:
+            vdi_ref = self._session.call_xenapi("VBD.get_VDI", vbd_ref)
+            # Check if it's on an iSCSI SR
+            sr_ref = self._session.call_xenapi("VDI.get_SR", vdi_ref)
+            if self._session.call_xenapi("SR.get_type", sr_ref) == 'iscsi':
+                iscsi_srs.append(sr_ref)
+
+        return iscsi_srs
 
     def check_can_live_migrate_destination(self, ctxt, instance_ref,
                                            block_migration=False,
@@ -1685,6 +1787,20 @@ class VMOps(object):
             # block migration work will be able to resolve this
         return dest_check_data
 
+    def _is_xsm_sr_check_relaxed(self):
+        try:
+            return self.cached_xsm_sr_relaxed
+        except AttributeError:
+            config_value = None
+            try:
+                config_value = self._make_plugin_call('config_file',
+                                                      'get_val',
+                                                      key='relax-xsm-sr-check')
+            except Exception as exc:
+                LOG.exception(exc)
+            self.cached_xsm_sr_relaxed = config_value == "true"
+            return self.cached_xsm_sr_relaxed
+
     def check_can_live_migrate_source(self, ctxt, instance_ref,
                                       dest_check_data):
         """Check if it's possible to execute live migration on the source side.
@@ -1695,6 +1811,13 @@ class VMOps(object):
                                 destination, includes block_migration flag
 
         """
+        if len(self._get_iscsi_srs(ctxt, instance_ref)) > 0:
+            # XAPI must support the relaxed SR check for live migrating with
+            # iSCSI VBDs
+            if not self._is_xsm_sr_check_relaxed():
+                raise exception.MigrationError(_('XAPI supporting '
+                                'relax-xsm-sr-check=true requried'))
+
         if 'migrate_data' in dest_check_data:
             vm_ref = self._get_vm_opaque_ref(instance_ref)
             migrate_data = dest_check_data['migrate_data']
@@ -1703,13 +1826,14 @@ class VMOps(object):
                     "VM.assert_can_migrate", vm_ref, migrate_data)
             except self._session.XenAPI.Failure as exc:
                 LOG.exception(exc)
-                raise exception.MigrationError(_('VM.assert_can_migrate'
-                                                 'failed'))
+                msg = _('VM.assert_can_migrate failed')
+                raise exception.MigrationPreCheckError(reason=msg)
         return dest_check_data
 
-    def _generate_vdi_map(self, destination_sr_ref, vm_ref):
+    def _generate_vdi_map(self, destination_sr_ref, vm_ref, sr_ref=None):
         """generate a vdi_map for _call_live_migrate_command."""
-        sr_ref = vm_utils.safe_find_sr(self._session)
+        if sr_ref is None:
+            sr_ref = vm_utils.safe_find_sr(self._session)
         vm_vdis = vm_utils.get_instance_vdis_for_sr(self._session,
                                                     vm_ref, sr_ref)
         return dict((vdi, destination_sr_ref) for vdi in vm_vdis)
@@ -1720,6 +1844,19 @@ class VMOps(object):
         migrate_send_data = migrate_data['migrate_send_data']
 
         vdi_map = self._generate_vdi_map(destination_sr_ref, vm_ref)
+
+        # Add destination SR refs for all of the VDIs that we created
+        # as part of the pre migration callback
+        if 'pre_live_migration_result' in migrate_data:
+            pre_migrate_data = migrate_data['pre_live_migration_result']
+            sr_uuid_map = pre_migrate_data.get('sr_uuid_map', [])
+            for sr_uuid in sr_uuid_map:
+                # Source and destination SRs have the same UUID, so get the
+                # reference for the local SR
+                sr_ref = self._session.call_xenapi("SR.get_by_uuid", sr_uuid)
+                vdi_map.update(
+                    self._generate_vdi_map(
+                        sr_uuid_map[sr_uuid], vm_ref, sr_ref))
         vif_map = {}
         options = {}
         self._session.call_xenapi(command_name, vm_ref,
@@ -1735,12 +1872,18 @@ class VMOps(object):
                 if not migrate_data:
                     raise exception.InvalidParameterValue('Block Migration '
                                     'requires migrate data from destination')
+
+                iscsi_srs = self._get_iscsi_srs(context, instance)
                 try:
                     self._call_live_migrate_command(
                         "VM.migrate_send", vm_ref, migrate_data)
                 except self._session.XenAPI.Failure as exc:
                     LOG.exception(exc)
                     raise exception.MigrationError(_('Migrate Send failed'))
+
+                # Tidy up the iSCSI SRs
+                for sr_ref in iscsi_srs:
+                    volume_utils.forget_sr(self._session, sr_ref)
             else:
                 host_ref = self._get_host_opaque_ref(context,
                                                      destination_hostname)
@@ -1773,3 +1916,26 @@ class VMOps(object):
                 usage[uuid] = {'memory_mb': memory_mb, 'uuid': uuid}
 
         return usage
+
+    def attach_block_device_volumes(self, block_device_info):
+        sr_uuid_map = {}
+        try:
+            if block_device_info is not None:
+                for block_device_map in block_device_info[
+                                                'block_device_mapping']:
+                    sr_uuid, _ = self._volumeops.attach_volume(
+                        block_device_map['connection_info'],
+                        None,
+                        block_device_map['mount_device'],
+                        hotplug=False)
+
+                    sr_ref = self._session.call_xenapi('SR.get_by_uuid',
+                                                       sr_uuid)
+                    sr_uuid_map[sr_uuid] = sr_ref
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                # Disconnect the volumes we just connected
+                for sr in sr_uuid_map:
+                    volume_utils.forget_sr(self._session, sr_uuid_map[sr_ref])
+
+        return sr_uuid_map

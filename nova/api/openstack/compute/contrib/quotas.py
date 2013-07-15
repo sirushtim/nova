@@ -24,15 +24,18 @@ import nova.context
 from nova import db
 from nova import exception
 from nova.openstack.common import log as logging
+from nova.openstack.common import strutils
 from nova import quota
 
 
 QUOTAS = quota.QUOTAS
 LOG = logging.getLogger(__name__)
+NON_QUOTA_KEYS = ['tenant_id', 'id', 'force']
 
 
 authorize_update = extensions.extension_authorizer('compute', 'quotas:update')
 authorize_show = extensions.extension_authorizer('compute', 'quotas:show')
+authorize_delete = extensions.extension_authorizer('compute', 'quotas:delete')
 
 
 class QuotaTemplate(xmlutil.TemplateBuilder):
@@ -48,6 +51,9 @@ class QuotaTemplate(xmlutil.TemplateBuilder):
 
 
 class QuotaSetsController(object):
+
+    def __init__(self, ext_mgr):
+        self.ext_mgr = ext_mgr
 
     def _format_quota_set(self, project_id, quota_set):
         """Convert the quota object to a result dict."""
@@ -90,30 +96,75 @@ class QuotaSetsController(object):
         project_id = id
 
         bad_keys = []
-        for key in body['quota_set'].keys():
+
+        # By default, we can force update the quota if the extended
+        # is not loaded
+        force_update = True
+        extended_loaded = False
+        if self.ext_mgr.is_loaded('os-extended-quotas'):
+            # force optional has been enabled, the default value of
+            # force_update need to be changed to False
+            extended_loaded = True
+            force_update = False
+
+        for key, value in body['quota_set'].items():
             if (key not in QUOTAS and
-                    key != 'tenant_id' and
-                    key != 'id'):
+                    key not in NON_QUOTA_KEYS):
                 bad_keys.append(key)
+                continue
+            if key == 'force' and extended_loaded:
+                # only check the force optional when the extended has
+                # been loaded
+                force_update = strutils.bool_from_string(value)
+            elif key not in NON_QUOTA_KEYS and value:
+                try:
+                    value = int(value)
+                except (ValueError, TypeError):
+                    msg = _("Quota '%(value)s' for %(key)s should be "
+                            "integer.") % locals()
+                    LOG.warn(msg)
+                    raise webob.exc.HTTPBadRequest(explanation=msg)
+                self._validate_quota_limit(value)
+
+        LOG.debug(_("force update quotas: %s") % force_update)
 
         if len(bad_keys) > 0:
             msg = _("Bad key(s) %s in quota_set") % ",".join(bad_keys)
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
-        for key in body['quota_set'].keys():
-            try:
-                value = int(body['quota_set'][key])
-            except (ValueError, TypeError):
-                LOG.warn(_("Quota for %s should be integer.") % key)
-                # NOTE(hzzhoushaoyu): Do not prevent valid value to be
-                # updated. If raise BadRequest, some may be updated and
-                # others may be not.
+        try:
+            project_quota = self._get_quotas(context, id, True)
+        except exception.NotAuthorized:
+            raise webob.exc.HTTPForbidden()
+
+        for key, value in body['quota_set'].items():
+            if key in NON_QUOTA_KEYS or not value:
                 continue
-            self._validate_quota_limit(value)
+            # validate whether already used and reserved exceeds the new
+            # quota, this check will be ignored if admin want to force
+            # update
+            value = int(value)
+            if force_update is not True and value >= 0:
+                quota_value = project_quota.get(key)
+                if quota_value and quota_value['limit'] >= 0:
+                    quota_used = (quota_value['in_use'] +
+                                  quota_value['reserved'])
+                    LOG.debug(_("Quota %(key)s used: %(quota_used)s, "
+                                "value: %(value)s."),
+                              {'key': key, 'quota_used': quota_used,
+                               'value': value})
+                    if quota_used > value:
+                        msg = (_("Quota value %(value)s for %(key)s are "
+                                "greater than already used and reserved "
+                                "%(quota_used)s") %
+                                {'value': value, 'key': key,
+                                 'quota_used': quota_used})
+                        raise webob.exc.HTTPBadRequest(explanation=msg)
+
             try:
-                db.quota_update(context, project_id, key, value)
-            except exception.ProjectQuotaNotFound:
                 db.quota_create(context, project_id, key, value)
+            except exception.QuotaExists:
+                db.quota_update(context, project_id, key, value)
             except exception.AdminRequired:
                 raise webob.exc.HTTPForbidden()
         return {'quota_set': self._get_quotas(context, id)}
@@ -123,6 +174,18 @@ class QuotaSetsController(object):
         context = req.environ['nova.context']
         authorize_show(context)
         return self._format_quota_set(id, QUOTAS.get_defaults(context))
+
+    def delete(self, req, id):
+        if self.ext_mgr.is_loaded('os-extended-quotas'):
+            context = req.environ['nova.context']
+            authorize_delete(context)
+            try:
+                nova.context.authorize_project_context(context, id)
+                QUOTAS.destroy_all_by_project(context, id)
+                return webob.Response(status_int=202)
+            except exception.NotAuthorized:
+                raise webob.exc.HTTPForbidden()
+        raise webob.exc.HTTPNotFound()
 
 
 class Quotas(extensions.ExtensionDescriptor):
@@ -137,7 +200,7 @@ class Quotas(extensions.ExtensionDescriptor):
         resources = []
 
         res = extensions.ResourceExtension('os-quota-sets',
-                                            QuotaSetsController(),
+                                            QuotaSetsController(self.ext_mgr),
                                             member_actions={'defaults': 'GET'})
         resources.append(res)
 

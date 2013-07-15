@@ -15,7 +15,7 @@
 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
-#    under the License
+#    under the License.
 
 import webob
 
@@ -93,9 +93,6 @@ def disassociate_floating_ip(self, context, instance, address):
         self.network_api.disassociate_floating_ip(context, instance, address)
     except exception.NotAuthorized:
         raise webob.exc.HTTPForbidden()
-    except exception.FloatingIpNotAssociated:
-        msg = _('Floating ip is not associated')
-        raise webob.exc.HTTPBadRequest(explanation=msg)
     except exception.CannotDisassociateAutoAssignedFloatingIP:
         msg = _('Cannot disassociate auto assigned floating ip')
         raise webob.exc.HTTPForbidden(explanation=msg)
@@ -128,7 +125,7 @@ class FloatingIPController(object):
 
         try:
             floating_ip = self.network_api.get_floating_ip(context, id)
-        except exception.NotFound:
+        except (exception.NotFound, exception.InvalidID):
             msg = _("Floating ip not found for id %s") % id
             raise webob.exc.HTTPNotFound(explanation=msg)
 
@@ -176,7 +173,7 @@ class FloatingIPController(object):
         # get the floating ip object
         try:
             floating_ip = self.network_api.get_floating_ip(context, id)
-        except exception.NotFound:
+        except (exception.NotFound, exception.InvalidID):
             msg = _("Floating ip not found for id %s") % id
             raise webob.exc.HTTPNotFound(explanation=msg)
         address = floating_ip['address']
@@ -186,7 +183,10 @@ class FloatingIPController(object):
 
         # disassociate if associated
         if floating_ip.get('fixed_ip_id'):
-            disassociate_floating_ip(self, context, instance, address)
+            try:
+                disassociate_floating_ip(self, context, instance, address)
+            except exception.FloatingIpNotAssociated:
+                LOG.info(_("Floating ip %s has been disassociated") % address)
 
         # release ip from project
         self.network_api.release_floating_ip(context, address)
@@ -198,10 +198,11 @@ class FloatingIPController(object):
 
 
 class FloatingIPActionController(wsgi.Controller):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, ext_mgr=None, *args, **kwargs):
         super(FloatingIPActionController, self).__init__(*args, **kwargs)
         self.compute_api = compute.API()
         self.network_api = network.API()
+        self.ext_mgr = ext_mgr
 
     @wsgi.action('addFloatingIp')
     def _add_floating_ip(self, req, id, body):
@@ -230,18 +231,27 @@ class FloatingIPActionController(wsgi.Controller):
             msg = _('No fixed ips associated to instance')
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
-        # TODO(tr3buchet): this will associate the floating IP with the
-        # first fixed_ip an instance has. This should be
-        # changed to support specifying a particular fixed_ip if
-        # multiple exist.
-        if len(fixed_ips) > 1:
-            msg = _('multiple fixed_ips exist, using the first: %s')
-            LOG.warning(msg, fixed_ips[0]['address'])
+        fixed_address = None
+        if self.ext_mgr.is_loaded('os-extended-floating-ips'):
+            if 'fixed_address' in body['addFloatingIp']:
+                fixed_address = body['addFloatingIp']['fixed_address']
+                for fixed in fixed_ips:
+                    if fixed['address'] == fixed_address:
+                        break
+                else:
+                    msg = _('Specified fixed address not assigned to instance')
+                    raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        if not fixed_address:
+            fixed_address = fixed_ips[0]['address']
+            if len(fixed_ips) > 1:
+                msg = _('multiple fixed_ips exist, using the first: %s')
+                LOG.warning(msg, fixed_address)
 
         try:
             self.network_api.associate_floating_ip(context, instance,
                                   floating_address=address,
-                                  fixed_address=fixed_ips[0]['address'])
+                                  fixed_address=fixed_address)
         except exception.FloatingIpAssociated:
             msg = _('floating ip is already associated')
             raise webob.exc.HTTPBadRequest(explanation=msg)
@@ -291,11 +301,15 @@ class FloatingIPActionController(wsgi.Controller):
             (uuidutils.is_uuid_like(id) and
              [instance['uuid'] == id] or
              [instance['id'] == id])[0]):
-            disassociate_floating_ip(self, context, instance, address)
+            try:
+                disassociate_floating_ip(self, context, instance, address)
+            except exception.FloatingIpNotAssociated:
+                msg = _('Floating ip is not associated')
+                raise webob.exc.HTTPBadRequest(explanation=msg)
             return webob.Response(status_int=202)
         else:
             msg = _("Floating ip %(address)s is not associated with instance "
-                    "%(id)s.") % locals()
+                    "%(id)s.") % {'address': address, 'id': id}
             raise webob.exc.HTTPUnprocessableEntity(explanation=msg)
 
 
@@ -318,6 +332,6 @@ class Floating_ips(extensions.ExtensionDescriptor):
         return resources
 
     def get_controller_extensions(self):
-        controller = FloatingIPActionController()
+        controller = FloatingIPActionController(self.ext_mgr)
         extension = extensions.ControllerExtension(self, 'servers', controller)
         return [extension]

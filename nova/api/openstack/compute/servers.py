@@ -28,11 +28,12 @@ from nova.api.openstack.compute.views import servers as views_servers
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
 from nova import compute
-from nova.compute import instance_types
+from nova.compute import flavors
 from nova import exception
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common.rpc import common as rpc_common
+from nova.openstack.common import strutils
 from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
 from nova import utils
@@ -185,7 +186,8 @@ class CommonDeserializer(wsgi.MetadataXMLDeserializer):
 
         res_id = server_node.getAttribute('return_reservation_id')
         if res_id:
-            server['return_reservation_id'] = utils.bool_from_str(res_id)
+            server['return_reservation_id'] = \
+                    strutils.bool_from_string(res_id)
 
         scheduler_hints = self._extract_scheduler_hints(server_node)
         if scheduler_hints:
@@ -253,7 +255,7 @@ class CommonDeserializer(wsgi.MetadataXMLDeserializer):
                 for attr in attributes:
                     value = child.getAttribute(attr)
                     if value:
-                        mapping[attr] = utils.bool_from_str(value)
+                        mapping[attr] = strutils.bool_from_string(value)
                 block_device_mapping.append(mapping)
             return block_device_mapping
         else:
@@ -461,7 +463,7 @@ class Controller(wsgi.Controller):
         super(Controller, self).__init__(**kwargs)
         self.compute_api = compute.API()
         self.ext_mgr = ext_mgr
-        self.quantum_attempted = False
+        self.neutron_attempted = False
 
     @wsgi.serializers(xml=MinimalServersTemplate)
     def index(self, req):
@@ -469,7 +471,7 @@ class Controller(wsgi.Controller):
         try:
             servers = self._get_servers(req, is_detail=False)
         except exception.Invalid as err:
-            raise exc.HTTPBadRequest(explanation=str(err))
+            raise exc.HTTPBadRequest(explanation=err.format_message())
         return servers
 
     @wsgi.serializers(xml=ServersTemplate)
@@ -478,20 +480,8 @@ class Controller(wsgi.Controller):
         try:
             servers = self._get_servers(req, is_detail=True)
         except exception.Invalid as err:
-            raise exc.HTTPBadRequest(explanation=str(err))
+            raise exc.HTTPBadRequest(explanation=err.format_message())
         return servers
-
-    def _add_instance_faults(self, ctxt, instances):
-        faults = self.compute_api.get_instance_faults(ctxt, instances)
-        if faults is not None:
-            for instance in instances:
-                faults_list = faults.get(instance['uuid'], [])
-                try:
-                    instance['fault'] = faults_list[0]
-                except IndexError:
-                    pass
-
-        return instances
 
     def _get_servers(self, req, is_detail):
         """Returns a list of servers, based on any search options specified."""
@@ -549,17 +539,18 @@ class Controller(wsgi.Controller):
             instance_list = self.compute_api.get_all(context,
                                                      search_opts=search_opts,
                                                      limit=limit,
-                                                     marker=marker)
-        except exception.MarkerNotFound as e:
+                                                     marker=marker,
+                                                     want_objects=True)
+        except exception.MarkerNotFound:
             msg = _('marker [%s] not found') % marker
             raise exc.HTTPBadRequest(explanation=msg)
-        except exception.FlavorNotFound as e:
+        except exception.FlavorNotFound:
             log_msg = _("Flavor '%s' could not be found ")
             LOG.debug(log_msg, search_opts['flavor'])
             instance_list = []
 
         if is_detail:
-            self._add_instance_faults(context, instance_list)
+            instance_list.fill_faults()
             response = self._view_builder.detail(req, instance_list)
         else:
             response = self._view_builder.index(req, instance_list)
@@ -569,7 +560,8 @@ class Controller(wsgi.Controller):
     def _get_server(self, context, req, instance_uuid):
         """Utility function for looking up an instance by uuid."""
         try:
-            instance = self.compute_api.get(context, instance_uuid)
+            instance = self.compute_api.get(context, instance_uuid,
+                                            want_objects=True)
         except exception.NotFound:
             msg = _("Instance could not be found")
             raise exc.HTTPNotFound(explanation=msg)
@@ -578,10 +570,12 @@ class Controller(wsgi.Controller):
 
     def _check_string_length(self, value, name, max_length=None):
         try:
+            if isinstance(value, basestring):
+                value = value.strip()
             utils.check_string_length(value, name, min_length=1,
                                       max_length=max_length)
         except exception.InvalidInput as e:
-            raise exc.HTTPBadRequest(explanation=str(e))
+            raise exc.HTTPBadRequest(explanation=e.format_message())
 
     def _validate_server_name(self, value):
         self._check_string_length(value, 'Server name', max_length=255)
@@ -618,21 +612,26 @@ class Controller(wsgi.Controller):
             injected_files.append((path, contents))
         return injected_files
 
-    def _is_quantum_v2(self):
-        # NOTE(dprince): quantumclient is not a requirement
-        if self.quantum_attempted:
-            return self.have_quantum
+    def _is_neutron_v2(self):
+        # NOTE(dprince): neutronclient is not a requirement
+        if self.neutron_attempted:
+            return self.have_neutron
 
         try:
-            self.quantum_attempted = True
-            from nova.network.quantumv2 import api as quantum_api
-            self.have_quantum = issubclass(
-                importutils.import_class(CONF.network_api_class),
-                quantum_api.API)
-        except ImportError:
-            self.have_quantum = False
+            # compatibility with Folsom/Grizzly configs
+            cls_name = CONF.network_api_class
+            if cls_name == 'nova.network.quantumv2.api.API':
+                cls_name = 'nova.network.neutronv2.api.API'
+            self.neutron_attempted = True
 
-        return self.have_quantum
+            from nova.network.neutronv2 import api as neutron_api
+            self.have_neutron = issubclass(
+                importutils.import_class(cls_name),
+                neutron_api.API)
+        except ImportError:
+            self.have_neutron = False
+
+        return self.have_neutron
 
     def _get_requested_networks(self, requested_networks):
         """Create a list of requested networks from the networks attribute."""
@@ -642,8 +641,8 @@ class Controller(wsgi.Controller):
                 port_id = network.get('port', None)
                 if port_id:
                     network_uuid = None
-                    if not self._is_quantum_v2():
-                        # port parameter is only for quantum v2.0
+                    if not self._is_neutron_v2():
+                        # port parameter is only for neutron v2.0
                         msg = _("Unknown argment : port")
                         raise exc.HTTPBadRequest(explanation=msg)
                     if not uuidutils.is_uuid_like(port_id):
@@ -670,9 +669,9 @@ class Controller(wsgi.Controller):
                     msg = _("Invalid fixed IP address (%s)") % address
                     raise exc.HTTPBadRequest(explanation=msg)
 
-                # For quantumv2, requestd_networks
+                # For neutronv2, requestd_networks
                 # should be tuple of (network_uuid, fixed_ip, port_id)
-                if self._is_quantum_v2():
+                if self._is_neutron_v2():
                     networks.append((network_uuid, address, port_id))
                 else:
                     # check if the network id is already present in the list,
@@ -733,9 +732,9 @@ class Controller(wsgi.Controller):
         """Returns server details by server id."""
         try:
             context = req.environ['nova.context']
-            instance = self.compute_api.get(context, id)
+            instance = self.compute_api.get(context, id,
+                                            want_objects=True)
             req.cache_db_instance(instance)
-            self._add_instance_faults(context, [instance])
             return self._view_builder.show(req, instance)
         except exception.NotFound:
             msg = _("Instance could not be found")
@@ -785,10 +784,13 @@ class Controller(wsgi.Controller):
 
         requested_networks = None
         if (self.ext_mgr.is_loaded('os-networks')
-                or self._is_quantum_v2()):
+                or self._is_neutron_v2()):
             requested_networks = server_dict.get('networks')
 
         if requested_networks is not None:
+            if not isinstance(requested_networks, list):
+                expl = _('Bad networks format')
+                raise exc.HTTPBadRequest(explanation=expl)
             requested_networks = self._get_requested_networks(
                 requested_networks)
 
@@ -826,7 +828,7 @@ class Controller(wsgi.Controller):
             for bdm in block_device_mapping:
                 self._validate_device_name(bdm["device_name"])
                 if 'delete_on_termination' in bdm:
-                    bdm['delete_on_termination'] = utils.bool_from_str(
+                    bdm['delete_on_termination'] = strutils.bool_from_string(
                         bdm['delete_on_termination'])
 
         ret_resv_id = False
@@ -872,7 +874,7 @@ class Controller(wsgi.Controller):
             scheduler_hints = server_dict.get('scheduler_hints', {})
 
         try:
-            _get_inst_type = instance_types.get_instance_type_by_flavor_id
+            _get_inst_type = flavors.get_flavor_by_flavor_id
             inst_type = _get_inst_type(flavor_id, read_deleted="no")
 
             (instances, resv_id) = self.compute_api.create(context,
@@ -900,32 +902,21 @@ class Controller(wsgi.Controller):
             raise exc.HTTPRequestEntityTooLarge(
                 explanation=error.format_message(),
                 headers={'Retry-After': 0})
-        except exception.InstanceTypeMemoryTooSmall as error:
-            raise exc.HTTPBadRequest(explanation=error.format_message())
-        except exception.InstanceTypeNotFound as error:
-            raise exc.HTTPBadRequest(explanation=error)
-        except exception.InstanceTypeDiskTooSmall as error:
-            raise exc.HTTPBadRequest(explanation=error.format_message())
-        except exception.InvalidMetadata as error:
-            raise exc.HTTPBadRequest(explanation=error.format_message())
         except exception.InvalidMetadataSize as error:
             raise exc.HTTPRequestEntityTooLarge(
                 explanation=error.format_message())
-        except exception.InvalidRequest as error:
-            raise exc.HTTPBadRequest(explanation=error.format_message())
         except exception.ImageNotFound as error:
             msg = _("Can not find requested image")
             raise exc.HTTPBadRequest(explanation=msg)
-        except exception.ImageNotActive as error:
-            raise exc.HTTPBadRequest(explanation=error.format_message())
         except exception.FlavorNotFound as error:
             msg = _("Invalid flavorRef provided.")
             raise exc.HTTPBadRequest(explanation=msg)
         except exception.KeypairNotFound as error:
             msg = _("Invalid key_name provided.")
             raise exc.HTTPBadRequest(explanation=msg)
-        except exception.SecurityGroupNotFound as error:
-            raise exc.HTTPBadRequest(explanation=error.format_message())
+        except exception.ConfigDriveInvalidValue:
+            msg = _("Invalid config_drive provided.")
+            raise exc.HTTPBadRequest(explanation=msg)
         except rpc_common.RemoteError as err:
             msg = "%(err_type)s: %(err_msg)s" % {'err_type': err.exc_type,
                                                  'err_msg': err.value}
@@ -933,7 +924,14 @@ class Controller(wsgi.Controller):
         except UnicodeDecodeError as error:
             msg = "UnicodeError: %s" % unicode(error)
             raise exc.HTTPBadRequest(explanation=msg)
-        # Let the caller deal with unhandled exceptions.
+        except (exception.ImageNotActive,
+                exception.InstanceTypeDiskTooSmall,
+                exception.InstanceTypeMemoryTooSmall,
+                exception.InstanceTypeNotFound,
+                exception.InvalidMetadata,
+                exception.InvalidRequest,
+                exception.SecurityGroupNotFound) as error:
+            raise exc.HTTPBadRequest(explanation=error.format_message())
 
         # If the caller wanted a reservation_id, return it
         if ret_resv_id:
@@ -943,11 +941,8 @@ class Controller(wsgi.Controller):
         req.cache_db_instances(instances)
         server = self._view_builder.create(req, instances[0])
 
-        if '_is_precooked' in server['server'].keys():
-            del server['server']['_is_precooked']
-        else:
-            if CONF.enable_instance_password:
-                server['server']['adminPass'] = password
+        if CONF.enable_instance_password:
+            server['server']['adminPass'] = password
 
         robj = wsgi.ResponseObject(server)
 
@@ -976,22 +971,20 @@ class Controller(wsgi.Controller):
 
         if 'accessIPv4' in body['server']:
             access_ipv4 = body['server']['accessIPv4']
-            if access_ipv4 is None:
-                access_ipv4 = ''
             if access_ipv4:
                 self._validate_access_ipv4(access_ipv4)
-            update_dict['access_ip_v4'] = access_ipv4.strip()
+            update_dict['access_ip_v4'] = (
+                access_ipv4 and access_ipv4.strip() or None)
 
         if 'accessIPv6' in body['server']:
             access_ipv6 = body['server']['accessIPv6']
-            if access_ipv6 is None:
-                access_ipv6 = ''
             if access_ipv6:
                 self._validate_access_ipv6(access_ipv6)
-            update_dict['access_ip_v6'] = access_ipv6.strip()
+            update_dict['access_ip_v6'] = (
+                access_ipv6 and access_ipv6.strip() or None)
 
         if 'auto_disk_config' in body['server']:
-            auto_disk_config = utils.bool_from_str(
+            auto_disk_config = strutils.bool_from_string(
                     body['server']['auto_disk_config'])
             update_dict['auto_disk_config'] = auto_disk_config
 
@@ -1004,16 +997,19 @@ class Controller(wsgi.Controller):
             raise exc.HTTPBadRequest(explanation=msg)
 
         try:
-            instance = self.compute_api.get(ctxt, id)
+            instance = self.compute_api.get(ctxt, id,
+                                            want_objects=True)
             req.cache_db_instance(instance)
             self.compute_api.update(ctxt, instance, **update_dict)
         except exception.NotFound:
             msg = _("Instance could not be found")
             raise exc.HTTPNotFound(explanation=msg)
 
+        # FIXME(danms): Until compute_api.update() is object-aware,
+        # we need to apply the updates to the instance object so
+        # that views will return the new data
         instance.update(update_dict)
 
-        self._add_instance_faults(ctxt, [instance])
         return self._view_builder.show(req, instance)
 
     @wsgi.response(202)
@@ -1096,6 +1092,17 @@ class Controller(wsgi.Controller):
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'resize')
+        except exception.ImageNotAuthorized:
+            msg = _("You are not authorized to access the image "
+                    "the instance was started with.")
+            raise exc.HTTPUnauthorized(explanation=msg)
+        except exception.ImageNotFound:
+            msg = _("Image that the instance was started "
+                    "with could not be found.")
+            raise exc.HTTPBadRequest(explanation=msg)
+        except exception.Invalid:
+            msg = _("Invalid instance image.")
+            raise exc.HTTPBadRequest(explanation=msg)
 
         return webob.Response(status_int=202)
 
@@ -1163,7 +1170,7 @@ class Controller(wsgi.Controller):
     def _action_change_password(self, req, id, body):
         context = req.environ['nova.context']
         if (not 'changePassword' in body
-            or 'adminPass' not in body['changePassword']):
+                or 'adminPass' not in body['changePassword']):
             msg = _("No adminPass was specified")
             raise exc.HTTPBadRequest(explanation=msg)
         password = body['changePassword']['adminPass']
@@ -1280,23 +1287,20 @@ class Controller(wsgi.Controller):
         except exception.InstanceNotFound:
             msg = _("Instance could not be found")
             raise exc.HTTPNotFound(explanation=msg)
-        except exception.InvalidMetadata as error:
-            raise exc.HTTPBadRequest(
-                explanation=error.format_message())
         except exception.InvalidMetadataSize as error:
             raise exc.HTTPRequestEntityTooLarge(
                 explanation=error.format_message())
         except exception.ImageNotFound:
             msg = _("Cannot find image for rebuild")
             raise exc.HTTPBadRequest(explanation=msg)
-        except exception.InstanceTypeMemoryTooSmall as error:
-            raise exc.HTTPBadRequest(explanation=error.format_message())
-        except exception.InstanceTypeDiskTooSmall as error:
+        except (exception.ImageNotActive,
+                exception.InstanceTypeDiskTooSmall,
+                exception.InstanceTypeMemoryTooSmall,
+                exception.InvalidMetadata) as error:
             raise exc.HTTPBadRequest(explanation=error.format_message())
 
         instance = self._get_server(context, req, id)
 
-        self._add_instance_faults(context, [instance])
         view = self._view_builder.show(req, instance)
 
         # Add on the adminPass attribute since the view doesn't do it
@@ -1357,6 +1361,8 @@ class Controller(wsgi.Controller):
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                         'createImage')
+        except exception.Invalid as err:
+            raise exc.HTTPBadRequest(explanation=err.format_message())
 
         # build location of newly-created image entity
         image_id = str(image['id'])
@@ -1388,7 +1394,7 @@ class Controller(wsgi.Controller):
     def _get_server_search_options(self):
         """Return server search options allowed by non-admin."""
         return ('reservation_id', 'name', 'status', 'image', 'flavor',
-                'changes-since', 'all_tenants')
+                'ip', 'changes-since', 'all_tenants')
 
 
 def create_resource(ext_mgr):
@@ -1402,9 +1408,8 @@ def remove_invalid_options(context, search_options, allowed_search_options):
         return
     # Otherwise, strip out all unknown options
     unknown_options = [opt for opt in search_options
-            if opt not in allowed_search_options]
-    unk_opt_str = ", ".join(unknown_options)
-    log_msg = _("Removing options '%(unk_opt_str)s' from query") % locals()
-    LOG.debug(log_msg)
+                        if opt not in allowed_search_options]
+    LOG.debug(_("Removing options '%s' from query"),
+              ", ".join(unknown_options))
     for opt in unknown_options:
         search_options.pop(opt, None)

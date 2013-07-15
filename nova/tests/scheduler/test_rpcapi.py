@@ -28,7 +28,7 @@ from nova import test
 CONF = cfg.CONF
 
 
-class SchedulerRpcAPITestCase(test.TestCase):
+class SchedulerRpcAPITestCase(test.NoDBTestCase):
     def _test_scheduler_api(self, method, rpc_method, **kwargs):
         ctxt = context.RequestContext('fake_user', 'fake_project')
         rpcapi = scheduler_rpcapi.SchedulerAPI()
@@ -69,10 +69,6 @@ class SchedulerRpcAPITestCase(test.TestCase):
                 request_spec='fake_request_spec',
                 filter_properties='fake_props', reservations=list('fake_res'))
 
-    def test_show_host_resources(self):
-        self._test_scheduler_api('show_host_resources', rpc_method='call',
-                host='fake_host')
-
     def test_live_migration(self):
         self._test_scheduler_api('live_migration', rpc_method='call',
                 block_migration='fake_block_migration',
@@ -90,3 +86,9 @@ class SchedulerRpcAPITestCase(test.TestCase):
                 request_spec='fake_request_spec',
                 filter_properties='fake_prop',
                 version='2.6')
+
+    def test_select_destinations(self):
+        self._test_scheduler_api('select_destinations', rpc_method='call',
+                request_spec='fake_request_spec',
+                filter_properties='fake_prop',
+                version='2.7')

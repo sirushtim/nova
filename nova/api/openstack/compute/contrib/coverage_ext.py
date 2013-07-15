@@ -12,7 +12,7 @@
 #    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
-#    under the License
+#    under the License.
 
 # See: http://wiki.openstack.org/Nova/CoverageExtension for more information
 # and usage explanation for this API extension
@@ -42,7 +42,7 @@ CONF = cfg.CONF
 class CoverageController(object):
     """The Coverage report API controller for the OpenStack API."""
     def __init__(self):
-        self.data_path = tempfile.mkdtemp(prefix='nova-coverage_')
+        self.data_path = None
         self.services = []
         self.combine = False
         self._cover_inst = None
@@ -54,6 +54,8 @@ class CoverageController(object):
         if not self._cover_inst:
             try:
                 import coverage
+                if self.data_path is None:
+                    self.data_path = tempfile.mkdtemp(prefix='nova-coverage_')
                 data_out = os.path.join(self.data_path, '.nova-coverage.api')
                 self._cover_inst = coverage.coverage(data_file=data_out)
             except ImportError:
@@ -132,11 +134,12 @@ class CoverageController(object):
             # doesn't resolve to 127.0.0.1. Currently backdoors only open on
             # loopback so this is for covering the common single host use case
             except socket.error as e:
+                exc_info = sys.exc_info()
                 if 'ECONNREFUSED' in e and service['host'] == self.host:
                         service['telnet'] = telnetlib.Telnet('127.0.0.1',
                                                              service['port'])
                 else:
-                    raise e
+                    raise exc_info[0], exc_info[1], exc_info[2]
             self.services.append(service)
             self._start_coverage_telnet(service['telnet'], service['service'])
 

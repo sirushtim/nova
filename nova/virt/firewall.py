@@ -24,8 +24,8 @@ from nova import context
 from nova import network
 from nova.network import linux_net
 from nova.openstack.common import importutils
-from nova.openstack.common import lockutils
 from nova.openstack.common import log as logging
+from nova import utils
 from nova.virt import netutils
 
 LOG = logging.getLogger(__name__)
@@ -61,7 +61,9 @@ class FirewallDriver(object):
 
     def prepare_instance_filter(self, instance, network_info):
         """Prepare filters for the instance.
-        At this point, the instance isn't running yet."""
+
+        At this point, the instance isn't running yet.
+        """
         raise NotImplementedError()
 
     def filter_defer_apply_on(self):
@@ -90,14 +92,16 @@ class FirewallDriver(object):
         """Refresh security group rules from data store
 
         Gets called when a rule has been added to or removed from
-        the security group."""
+        the security group.
+        """
         raise NotImplementedError()
 
     def refresh_security_group_members(self, security_group_id):
         """Refresh security group members from data store
 
         Gets called when an instance gets added to or removed from
-        the security group."""
+        the security group.
+        """
         raise NotImplementedError()
 
     def refresh_instance_security_rules(self, instance):
@@ -105,7 +109,8 @@ class FirewallDriver(object):
 
         Gets called when an instance gets added to or removed from
         the security group the instance is a member of or if the
-        group gains or looses a rule."""
+        group gains or looses a rule.
+        """
         raise NotImplementedError()
 
     def refresh_provider_fw_rules(self):
@@ -213,8 +218,9 @@ class IptablesFirewallDriver(FirewallDriver):
 
     def _filters_for_instance(self, chain_name, network_info):
         """Creates a rule corresponding to each ip that defines a
-             jump to the corresponding instance - chain for all the traffic
-             destined to that ip."""
+           jump to the corresponding instance - chain for all the traffic
+           destined to that ip.
+        """
         # make sure this is legacy nw_info
         network_info = self._handle_network_info_model(network_info)
 
@@ -453,7 +459,7 @@ class IptablesFirewallDriver(FirewallDriver):
         self.do_refresh_instance_rules(instance)
         self.iptables.apply()
 
-    @lockutils.synchronized('iptables', 'nova-', external=True)
+    @utils.synchronized('iptables', external=True)
     def _inner_do_refresh_rules(self, instance, ipv4_rules,
                                                ipv6_rules):
         self.remove_filters_for_instance(instance)
@@ -476,7 +482,7 @@ class IptablesFirewallDriver(FirewallDriver):
         self._do_refresh_provider_fw_rules()
         self.iptables.apply()
 
-    @lockutils.synchronized('iptables', 'nova-', external=True)
+    @utils.synchronized('iptables', external=True)
     def _do_refresh_provider_fw_rules(self):
         """Internal, synchronized version of refresh_provider_fw_rules."""
         self._purge_provider_fw_rules()

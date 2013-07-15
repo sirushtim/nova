@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright 2010 United States Government as represented by the
@@ -42,7 +41,7 @@ def main():
     logging.setup("nova")
     utils.monkey_patch()
 
-    launcher = service.ProcessLauncher()
+    launcher = service.process_launcher()
     for api in CONF.enabled_apis:
         should_use_ssl = api in CONF.enabled_ssl_apis
         if api == 'ec2':
@@ -50,5 +49,5 @@ def main():
                                          max_url_len=16384)
         else:
             server = service.WSGIService(api, use_ssl=should_use_ssl)
-        launcher.launch_server(server, workers=server.workers or 1)
+        launcher.launch_service(server, workers=server.workers or 1)
     launcher.wait()

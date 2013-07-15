@@ -143,7 +143,8 @@ class EC2Driver(driver.ComputeDriver):
     def __init__(self, virtapi):
         super(EC2Driver, self).__init__(virtapi)
         self._compute_event_callback = None
-        self.conn = boto.ec2.connect_to_region("us-east-1",aws_access_key_id='AKIAID3OJUWPDDSYJ6ZQ',aws_secret_access_key='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')
+	# Add access key and secret key. Should use config.CFG to retreive this ideally.
+        self.conn = boto.ec2.connect_to_region("us-east-1",aws_access_key_id='',aws_secret_access_key='')
 
     def init_host(self, host):
         """Initialize anything that is necessary for the driver to function,

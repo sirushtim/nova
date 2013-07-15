@@ -36,7 +36,8 @@ def start_transfer(context, read_file_handle, data_size,
     """Start the data transfer from the reader to the writer.
     Reader writes to the pipe and the writer reads from the pipe. This means
     that the total transfer time boils down to the slower of the read/write
-    and not the addition of the two times."""
+    and not the addition of the two times.
+    """
 
     if not image_meta:
         image_meta = {}
@@ -122,13 +123,17 @@ def upload_image(context, image, instance, **kwargs):
     (image_service, image_id) = glance.get_remote_image_service(context, image)
     # The properties and other fields that we need to set for the image.
     image_metadata = {"disk_format": "vmdk",
+                      "is_public": "false",
+                      "name": kwargs.get("snapshot_name"),
+                      "status": "active",
                       "container_format": "bare",
                       "size": file_size,
                       "properties": {"vmware_adaptertype":
                                             kwargs.get("adapter_type"),
                                      "vmware_ostype": kwargs.get("os_type"),
                                      "vmware_image_version":
-                                            kwargs.get("image_version")}}
+                                            kwargs.get("image_version"),
+                                     "owner_id": instance['project_id']}}
     start_transfer(context, read_file_handle, file_size,
                    image_service=image_service,
                    image_id=image_id, image_meta=image_metadata)
@@ -148,6 +153,6 @@ def get_vmdk_size_and_properties(context, image, instance):
     (image_service, image_id) = glance.get_remote_image_service(context, image)
     meta_data = image_service.show(context, image_id)
     size, properties = meta_data["size"], meta_data["properties"]
-    LOG.debug(_("Got image size of %(size)s for the image %(image)s") %
-              locals(), instance=instance)
+    LOG.debug(_("Got image size of %(size)s for the image %(image)s"),
+              {'size': size, 'image': image}, instance=instance)
     return size, properties

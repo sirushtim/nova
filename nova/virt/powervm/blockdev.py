@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 IBM Corp.
+# Copyright 2013 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -20,12 +20,12 @@ import re
 
 from oslo.config import cfg
 
-from nova.compute import instance_types
+from nova.compute import flavors
 from nova.compute import task_states
 from nova.image import glance
 from nova.openstack.common import excutils
 from nova.openstack.common import log as logging
-from nova import utils
+from nova.openstack.common import processutils
 from nova.virt import images
 from nova.virt.powervm import command
 from nova.virt.powervm import common
@@ -125,8 +125,10 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
         self.connection_data = connection
 
     def _set_connection(self):
-        if self._connection is None:
-            self._connection = common.ssh_connect(self.connection_data)
+        # create a new connection or verify an existing connection
+        # and re-establish if the existing connection is dead
+        self._connection = common.check_connection(self._connection,
+                                                   self.connection_data)
 
     def create_volume(self, size):
         """Creates a logical volume with a minimum size
@@ -175,10 +177,11 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
 
         # calculate root device size in bytes
         # we respect the minimum root device size in constants
-        instance_type = instance_types.extract_instance_type(instance)
+        instance_type = flavors.extract_flavor(instance)
         size_gb = max(instance_type['root_gb'], constants.POWERVM_MIN_ROOT_GB)
         size = size_gb * 1024 * 1024 * 1024
 
+        disk_name = None
         try:
             LOG.debug(_("Creating logical volume of size %s bytes") % size)
             disk_name = self._create_logical_volume(size)
@@ -190,12 +193,13 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
                         "Will attempt cleanup."))
             # attempt cleanup of logical volume before re-raising exception
             with excutils.save_and_reraise_exception():
-                try:
-                    self.delete_volume(disk_name)
-                except Exception:
-                    msg = _('Error while attempting cleanup of failed '
-                            'deploy to logical volume.')
-                    LOG.exception(msg)
+                if disk_name is not None:
+                    try:
+                        self.delete_volume(disk_name)
+                    except Exception:
+                        msg = _('Error while attempting cleanup of failed '
+                                'deploy to logical volume.')
+                        LOG.exception(msg)
 
         return {'device_name': disk_name}
 
@@ -244,9 +248,9 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
         # clean up local image file
         try:
             os.remove(snapshot_file_path)
-        except OSError as ose:
-            LOG.warn(_("Failed to clean up snapshot file "
-                       "%(snapshot_file_path)s") % locals())
+        except OSError:
+            LOG.warn(_("Failed to clean up snapshot file %s"),
+                     snapshot_file_path)
 
     def migrate_volume(self, lv_name, src_host, dest, image_path,
             instance_name=None):
@@ -380,6 +384,22 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
         output = self.run_vios_command_as_root(cmd)
         return output[0]
 
+    def _checksum_local_file(self, source_path):
+        """Calculate local file checksum.
+
+        :param source_path: source file path
+        :returns: string -- the md5sum of local file
+        """
+        with open(source_path, 'r') as img_file:
+            hasher = hashlib.md5()
+            block_size = 0x10000
+            buf = img_file.read(block_size)
+            while len(buf) > 0:
+                hasher.update(buf)
+                buf = img_file.read(block_size)
+            source_cksum = hasher.hexdigest()
+        return source_cksum
+
     def _copy_image_file(self, source_path, remote_path, decompress=False):
         """Copy file to VIOS, decompress it, and return its new size and name.
 
@@ -389,14 +409,7 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
                            if False (default), just copies the file
         """
         # Calculate source image checksum
-        hasher = hashlib.md5()
-        block_size = 0x10000
-        img_file = file(source_path, 'r')
-        buf = img_file.read(block_size)
-        while len(buf) > 0:
-            hasher.update(buf)
-            buf = img_file.read(block_size)
-        source_cksum = hasher.hexdigest()
+        source_cksum = self._checksum_local_file(source_path)
 
         comp_path = os.path.join(remote_path, os.path.basename(source_path))
         if comp_path.endswith(".gz"):
@@ -414,18 +427,31 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
 
         # If the image does not exist already
         if not output:
-            # Copy file to IVM
-            common.ftp_put_command(self.connection_data, source_path,
-                                   remote_path)
+            try:
+                # Copy file to IVM
+                common.ftp_put_command(self.connection_data, source_path,
+                                       remote_path)
+            except exception.PowerVMFTPTransferFailed:
+                with excutils.save_and_reraise_exception():
+                    cmd = "/usr/bin/rm -f %s" % final_path
+                    self.run_vios_command_as_root(cmd)
 
             # Verify image file checksums match
             output = self._md5sum_remote_file(final_path)
             if not output:
                 LOG.error(_("Unable to get checksum"))
-                raise exception.PowerVMFileTransferFailed()
+                # Cleanup inconsistent remote file
+                cmd = "/usr/bin/rm -f %s" % final_path
+                self.run_vios_command_as_root(cmd)
+
+                raise exception.PowerVMFileTransferFailed(file_path=final_path)
             if source_cksum != output.split(' ')[0]:
                 LOG.error(_("Image checksums do not match"))
-                raise exception.PowerVMFileTransferFailed()
+                # Cleanup inconsistent remote file
+                cmd = "/usr/bin/rm -f %s" % final_path
+                self.run_vios_command_as_root(cmd)
+
+                raise exception.PowerVMFileTransferFailed(file_path=final_path)
 
             if decompress:
                 # Unzip the image
@@ -505,19 +531,13 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
                                local_file_path)
 
         # Calculate copied image checksum
-        with open(local_file_path, 'r') as image_file:
-            hasher = hashlib.md5()
-            block_size = 0x10000
-            buf = image_file.read(block_size)
-            while len(buf) > 0:
-                hasher.update(buf)
-                buf = image_file.read(block_size)
-            dest_chksum = hasher.hexdigest()
+        dest_chksum = self._checksum_local_file(local_file_path)
 
         # do comparison
         if source_chksum and dest_chksum != source_chksum:
             LOG.error(_("Image checksums do not match"))
-            raise exception.PowerVMFileTransferFailed()
+            raise exception.PowerVMFileTransferFailed(
+                                      file_path=local_file_path)
 
         # Cleanup transferred remote file
         cmd = "/usr/bin/rm -f %s" % copy_from_path
@@ -531,8 +551,15 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
         :param command: String with the command to run.
         """
         self._set_connection()
-        stdout, stderr = utils.ssh_execute(self._connection, cmd,
-                                           check_exit_code=check_exit_code)
+        stdout, stderr = processutils.ssh_execute(
+            self._connection, cmd, check_exit_code=check_exit_code)
+
+        error_text = stderr.strip()
+        if error_text:
+            LOG.debug(_("Found error stream for command \"%(cmd)s\": "
+                        "%(error_text)s"),
+                      {'cmd': cmd, 'error_text': error_text})
+
         return stdout.strip().splitlines()
 
     def run_vios_command_as_root(self, command, check_exit_code=True):
@@ -543,4 +570,11 @@ class PowerVMLocalVolumeAdapter(PowerVMDiskAdapter):
         self._set_connection()
         stdout, stderr = common.ssh_command_as_root(
             self._connection, command, check_exit_code=check_exit_code)
+
+        error_text = stderr.read()
+        if error_text:
+            LOG.debug(_("Found error stream for command \"%(command)s\":"
+                        " %(error_text)s"),
+                      {'command': command, 'error_text': error_text})
+
         return stdout.read().splitlines()

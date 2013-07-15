@@ -35,6 +35,7 @@ import nova.cert.rpcapi
 from nova import exception
 from nova.image import glance
 from nova.openstack.common import log as logging
+from nova.openstack.common import processutils
 from nova import utils
 
 
@@ -73,6 +74,16 @@ CONF.import_opt('my_ip', 'nova.netconf')
 
 class S3ImageService(object):
     """Wraps an existing image service to support s3 based register."""
+    # translate our internal state to states valid by the EC2 API documentation
+    image_state_map = {'downloading': 'pending',
+                       'failed_download': 'failed',
+                       'decrypting': 'pending',
+                       'failed_decrypt': 'failed',
+                       'untarring': 'pending',
+                       'failed_untar': 'failed',
+                       'uploading': 'pending',
+                       'failed_upload': 'failed',
+                       'available': 'available'}
 
     def __init__(self, service=None, *args, **kwargs):
         self.cert_rpcapi = nova.cert.rpcapi.CertAPI()
@@ -100,6 +111,12 @@ class S3ImageService(object):
             else:
                 image_id = ec2utils.glance_id_to_id(context, image_uuid)
                 image_copy['properties'][prop] = image_id
+
+        try:
+            image_copy['properties']['image_state'] = self.image_state_map[
+                image['properties']['image_state']]
+        except (KeyError, ValueError):
+            pass
 
         return image_copy
 
@@ -181,13 +198,11 @@ class S3ImageService(object):
     def _s3_parse_manifest(self, context, metadata, manifest):
         manifest = etree.fromstring(manifest)
         image_format = 'ami'
-        image_type = 'machine'
 
         try:
             kernel_id = manifest.find('machine_configuration/kernel_id').text
             if kernel_id == 'true':
                 image_format = 'aki'
-                image_type = 'kernel'
                 kernel_id = None
         except Exception:
             kernel_id = None
@@ -196,7 +211,6 @@ class S3ImageService(object):
             ramdisk_id = manifest.find('machine_configuration/ramdisk_id').text
             if ramdisk_id == 'true':
                 image_format = 'ari'
-                image_type = 'ramdisk'
                 ramdisk_id = None
         except Exception:
             ramdisk_id = None
@@ -253,7 +267,7 @@ class S3ImageService(object):
 
         #TODO(bcwaldon): right now, this removes user-defined ids.
         # We need to re-enable this.
-        image_id = metadata.pop('id', None)
+        metadata.pop('id', None)
 
         image = self.service.create(context, metadata)
 
@@ -266,10 +280,9 @@ class S3ImageService(object):
 
     def _s3_create(self, context, metadata):
         """Gets a manifest from s3 and makes an image."""
-
         image_path = tempfile.mkdtemp(dir=CONF.image_decryption_dir)
 
-        image_location = metadata['properties']['image_location']
+        image_location = metadata['properties']['image_location'].lstrip('/')
         bucket_name = image_location.split('/')[0]
         manifest_path = image_location[len(bucket_name) + 1:]
         bucket = self._conn(context).get_bucket(bucket_name)
@@ -296,73 +309,78 @@ class S3ImageService(object):
                 self.service.update(context, image_uuid, metadata, image_data,
                                     purge_props=False)
 
-            _update_image_state(context, image_uuid, 'downloading')
-
             try:
-                parts = []
-                elements = manifest.find('image').getiterator('filename')
-                for fn_element in elements:
-                    part = self._download_file(bucket,
-                                               fn_element.text,
-                                               image_path)
-                    parts.append(part)
+                _update_image_state(context, image_uuid, 'downloading')
 
-                # NOTE(vish): this may be suboptimal, should we use cat?
-                enc_filename = os.path.join(image_path, 'image.encrypted')
-                with open(enc_filename, 'w') as combined:
-                    for filename in parts:
-                        with open(filename) as part:
-                            shutil.copyfileobj(part, combined)
+                try:
+                    parts = []
+                    elements = manifest.find('image').getiterator('filename')
+                    for fn_element in elements:
+                        part = self._download_file(bucket,
+                                                   fn_element.text,
+                                                   image_path)
+                        parts.append(part)
 
-            except Exception:
-                LOG.exception(_("Failed to download %(image_location)s "
-                                "to %(image_path)s"), log_vars)
-                _update_image_state(context, image_uuid, 'failed_download')
+                    # NOTE(vish): this may be suboptimal, should we use cat?
+                    enc_filename = os.path.join(image_path, 'image.encrypted')
+                    with open(enc_filename, 'w') as combined:
+                        for filename in parts:
+                            with open(filename) as part:
+                                shutil.copyfileobj(part, combined)
+
+                except Exception:
+                    LOG.exception(_("Failed to download %(image_location)s "
+                                    "to %(image_path)s"), log_vars)
+                    _update_image_state(context, image_uuid, 'failed_download')
+                    return
+
+                _update_image_state(context, image_uuid, 'decrypting')
+
+                try:
+                    hex_key = manifest.find('image/ec2_encrypted_key').text
+                    encrypted_key = binascii.a2b_hex(hex_key)
+                    hex_iv = manifest.find('image/ec2_encrypted_iv').text
+                    encrypted_iv = binascii.a2b_hex(hex_iv)
+
+                    dec_filename = os.path.join(image_path, 'image.tar.gz')
+                    self._decrypt_image(context, enc_filename, encrypted_key,
+                                        encrypted_iv, dec_filename)
+                except Exception:
+                    LOG.exception(_("Failed to decrypt %(image_location)s "
+                                    "to %(image_path)s"), log_vars)
+                    _update_image_state(context, image_uuid, 'failed_decrypt')
+                    return
+
+                _update_image_state(context, image_uuid, 'untarring')
+
+                try:
+                    unz_filename = self._untarzip_image(image_path,
+                                                        dec_filename)
+                except Exception:
+                    LOG.exception(_("Failed to untar %(image_location)s "
+                                    "to %(image_path)s"), log_vars)
+                    _update_image_state(context, image_uuid, 'failed_untar')
+                    return
+
+                _update_image_state(context, image_uuid, 'uploading')
+                try:
+                    with open(unz_filename) as image_file:
+                        _update_image_data(context, image_uuid, image_file)
+                except Exception:
+                    LOG.exception(_("Failed to upload %(image_location)s "
+                                    "to %(image_path)s"), log_vars)
+                    _update_image_state(context, image_uuid, 'failed_upload')
+                    return
+
+                metadata = {'status': 'active',
+                            'properties': {'image_state': 'available'}}
+                self.service.update(context, image_uuid, metadata,
+                        purge_props=False)
+
+                shutil.rmtree(image_path)
+            except exception.ImageNotFound:
+                LOG.info(_("Image %s was deleted underneath us"), image_uuid)
                 return
-
-            _update_image_state(context, image_uuid, 'decrypting')
-
-            try:
-                hex_key = manifest.find('image/ec2_encrypted_key').text
-                encrypted_key = binascii.a2b_hex(hex_key)
-                hex_iv = manifest.find('image/ec2_encrypted_iv').text
-                encrypted_iv = binascii.a2b_hex(hex_iv)
-
-                dec_filename = os.path.join(image_path, 'image.tar.gz')
-                self._decrypt_image(context, enc_filename, encrypted_key,
-                                    encrypted_iv, dec_filename)
-            except Exception:
-                LOG.exception(_("Failed to decrypt %(image_location)s "
-                                "to %(image_path)s"), log_vars)
-                _update_image_state(context, image_uuid, 'failed_decrypt')
-                return
-
-            _update_image_state(context, image_uuid, 'untarring')
-
-            try:
-                unz_filename = self._untarzip_image(image_path, dec_filename)
-            except Exception:
-                LOG.exception(_("Failed to untar %(image_location)s "
-                                "to %(image_path)s"), log_vars)
-                _update_image_state(context, image_uuid, 'failed_untar')
-                return
-
-            _update_image_state(context, image_uuid, 'uploading')
-            try:
-                with open(unz_filename) as image_file:
-                    _update_image_data(context, image_uuid, image_file)
-            except Exception:
-                LOG.exception(_("Failed to upload %(image_location)s "
-                                "to %(image_path)s"), log_vars)
-                _update_image_state(context, image_uuid, 'failed_upload')
-                return
-
-            metadata = {'status': 'active',
-                        'properties': {'image_state': 'available'}}
-            self.service.update(context, image_uuid, metadata,
-                    purge_props=False)
-
-            shutil.rmtree(image_path)
 
         eventlet.spawn_n(delayed_create)
 
@@ -375,14 +393,14 @@ class S3ImageService(object):
             key = self.cert_rpcapi.decrypt_text(elevated,
                     project_id=context.project_id,
                     text=base64.b64encode(encrypted_key))
-        except Exception, exc:
+        except Exception as exc:
             msg = _('Failed to decrypt private key: %s') % exc
             raise exception.NovaException(msg)
         try:
             iv = self.cert_rpcapi.decrypt_text(elevated,
                     project_id=context.project_id,
                     text=base64.b64encode(encrypted_iv))
-        except Exception, exc:
+        except Exception as exc:
             raise exception.NovaException(_('Failed to decrypt initialization '
                                     'vector: %s') % exc)
 
@@ -393,7 +411,7 @@ class S3ImageService(object):
                           '-K', '%s' % (key,),
                           '-iv', '%s' % (iv,),
                           '-out', '%s' % (decrypted_filename,))
-        except exception.ProcessExecutionError, exc:
+        except processutils.ProcessExecutionError as exc:
             raise exception.NovaException(_('Failed to decrypt image file '
                                     '%(image_file)s: %(err)s') %
                                     {'image_file': encrypted_filename,

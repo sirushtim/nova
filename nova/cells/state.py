@@ -25,9 +25,10 @@ from oslo.config import cfg
 from nova.cells import rpc_driver
 from nova import context
 from nova.db import base
-from nova.openstack.common import lockutils
+from nova import exception
 from nova.openstack.common import log as logging
 from nova.openstack.common import timeutils
+from nova import utils
 
 cell_state_manager_opts = [
         cfg.IntOpt('db_check_interval',
@@ -41,6 +42,7 @@ LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 CONF.import_opt('name', 'nova.cells.opts', group='cells')
 CONF.import_opt('reserve_percent', 'nova.cells.opts', group='cells')
+CONF.import_opt('mute_child_interval', 'nova.cells.opts', group='cells')
 #CONF.import_opt('capabilities', 'nova.cells.opts', group='cells')
 CONF.register_opts(cell_state_manager_opts, group='cells')
 
@@ -77,12 +79,21 @@ class CellState(object):
 
     def get_cell_info(self):
         """Return subset of cell information for OS API use."""
-        db_fields_to_return = ['is_parent', 'weight_scale', 'weight_offset',
-                               'username', 'rpc_host', 'rpc_port']
+        db_fields_to_return = ['is_parent', 'weight_scale', 'weight_offset']
+        url_fields_to_return = {
+            'username': 'username',
+            'hostname': 'rpc_host',
+            'port': 'rpc_port',
+        }
         cell_info = dict(name=self.name, capabilities=self.capabilities)
         if self.db_info:
             for field in db_fields_to_return:
                 cell_info[field] = self.db_info[field]
+
+            url_info = rpc_driver.parse_transport_url(
+                self.db_info['transport_url'])
+            for field, canonical in url_fields_to_return.items():
+                cell_info[canonical] = url_info[field]
         return cell_info
 
     def send_message(self, message):
@@ -127,7 +138,7 @@ class CellStateManager(base.Base):
             else:
                 values = set([value])
             my_cell_capabs[name] = values
-            self.my_cell_state.update_capabilities(my_cell_capabs)
+        self.my_cell_state.update_capabilities(my_cell_capabs)
 
     def _refresh_cells_from_db(self, ctxt):
         """Make our cell info map match the db."""
@@ -258,7 +269,7 @@ class CellStateManager(base.Base):
                                     'units_by_mb': disk_mb_free_units}}
         self.my_cell_state.update_capacities(capacities)
 
-    @lockutils.synchronized('cell-db-sync', 'nova-')
+    @utils.synchronized('cell-db-sync')
     def _cell_db_sync(self):
         """Update status for all cells if it's time.  Most calls to
         this are from the check_for_update() decorator that checks
@@ -313,7 +324,8 @@ class CellStateManager(base.Base):
             cell = self.parent_cells.get(cell_name)
         if not cell:
             LOG.error(_("Unknown cell '%(cell_name)s' when trying to "
-                        "update capabilities"), locals())
+                        "update capabilities"),
+                      {'cell_name': cell_name})
             return
         # Make sure capabilities are sets.
         for capab_name, values in capabilities.items():
@@ -328,7 +340,8 @@ class CellStateManager(base.Base):
             cell = self.parent_cells.get(cell_name)
         if not cell:
             LOG.error(_("Unknown cell '%(cell_name)s' when trying to "
-                        "update capacities"), locals())
+                        "update capacities"),
+                      {'cell_name': cell_name})
             return
         cell.update_capacities(capacities)
 
@@ -337,6 +350,9 @@ class CellStateManager(base.Base):
         capabs = copy.deepcopy(self.my_cell_state.capabilities)
         if include_children:
             for cell in self.child_cells.values():
+                if timeutils.is_older_than(cell.last_seen,
+                                CONF.cells.mute_child_interval):
+                    continue
                 for capab_name, values in cell.capabilities.items():
                     if capab_name not in capabs:
                         capabs[capab_name] = set([])
@@ -359,3 +375,11 @@ class CellStateManager(base.Base):
             for cell in self.child_cells.values():
                 self._add_to_dict(capacities, cell.capacities)
         return capacities
+
+    @sync_from_db
+    def get_capacities(self, cell_name=None):
+        if not cell_name or cell_name == self.my_cell_state.name:
+            return self.get_our_capacities()
+        if cell_name in self.child_cells:
+            return self.child_cells[cell_name].capacities
+        raise exception.CellNotFound(cell_name=cell_name)

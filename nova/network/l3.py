@@ -53,7 +53,8 @@ class L3Driver(object):
         """Add a floating IP bound to the fixed IP with an optional
            l3_interface_id.  Some drivers won't care about the
            l3_interface_id so just pass None in that case. Network
-           is also an optional parameter."""
+           is also an optional parameter.
+        """
         raise NotImplementedError()
 
     def remove_floating_ip(self, floating_ip, fixed_ip, l3_interface_id,
@@ -64,6 +65,9 @@ class L3Driver(object):
         raise NotImplementedError()
 
     def remove_vpn(self, public_ip, port, private_ip):
+        raise NotImplementedError()
+
+    def clean_conntrack(self, fixed_ip):
         raise NotImplementedError()
 
     def teardown(self):
@@ -125,6 +129,9 @@ class LinuxNetL3(L3Driver):
         # the VPN forwarding rules
         pass
 
+    def clean_conntrack(self, fixed_ip):
+        linux_net.clean_conntrack(fixed_ip)
+
     def teardown(self):
         pass
 
@@ -132,7 +139,8 @@ class LinuxNetL3(L3Driver):
 class NullL3(L3Driver):
     """The L3 driver that doesn't do anything.  This class can be used when
        nova-network should not manipulate L3 forwarding at all (e.g., in a Flat
-       or FlatDHCP scenario)."""
+       or FlatDHCP scenario).
+    """
     def __init__(self):
         pass
 
@@ -163,6 +171,9 @@ class NullL3(L3Driver):
         pass
 
     def remove_vpn(self, public_ip, port, private_ip):
+        pass
+
+    def clean_conntrack(self, fixed_ip):
         pass
 
     def teardown(self):

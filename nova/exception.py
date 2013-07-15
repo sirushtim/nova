@@ -25,6 +25,7 @@ SHOULD include dedicated exception logging.
 """
 
 import functools
+import sys
 
 from oslo.config import cfg
 import webob.exc
@@ -53,25 +54,6 @@ class ConvertedException(webob.exc.WSGIHTTPException):
         super(ConvertedException, self).__init__()
 
 
-class ProcessExecutionError(IOError):
-    def __init__(self, stdout=None, stderr=None, exit_code=None, cmd=None,
-                 description=None):
-        self.exit_code = exit_code
-        self.stderr = stderr
-        self.stdout = stdout
-        self.cmd = cmd
-        self.description = description
-
-        if description is None:
-            description = _('Unexpected error while running command.')
-        if exit_code is None:
-            exit_code = '-'
-        message = _('%(description)s\nCommand: %(cmd)s\n'
-                    'Exit code: %(exit_code)s\nStdout: %(stdout)r\n'
-                    'Stderr: %(stderr)r') % locals()
-        IOError.__init__(self, message)
-
-
 def _cleanse_dict(original):
     """Strip all admin_password, new_pass, rescue_pass keys from a dict."""
     return dict((k, v) for k, v in original.iteritems() if not "_pass" in k)
@@ -92,7 +74,7 @@ def wrap_exception(notifier=None, publisher_id=None, event_type=None,
             # contain confidential information.
             try:
                 return f(self, context, *args, **kw)
-            except Exception, e:
+            except Exception as e:
                 with excutils.save_and_reraise_exception():
                     if notifier:
                         payload = dict(exception=e)
@@ -146,7 +128,8 @@ class NovaException(Exception):
             try:
                 message = self.message % kwargs
 
-            except Exception as e:
+            except Exception:
+                exc_info = sys.exc_info()
                 # kwargs doesn't match a variable in the message
                 # log the issue and the kwargs
                 LOG.exception(_('Exception in string format operation'))
@@ -154,7 +137,7 @@ class NovaException(Exception):
                     LOG.error("%s: %s" % (name, value))
 
                 if CONF.fatal_exception_format_errors:
-                    raise e
+                    raise exc_info[0], exc_info[1], exc_info[2]
                 else:
                     # at least get the core message out if something happened
                     message = self.message
@@ -176,6 +159,11 @@ class EC2APIError(NovaException):
         self.code = code
         outstr = '%s' % message
         super(EC2APIError, self).__init__(outstr)
+
+
+#TODO(bcwaldon): EOL this exception!
+class Duplicate(NovaException):
+    pass
 
 
 class EncryptionFailure(NovaException):
@@ -238,6 +226,17 @@ class InvalidBDMSnapshot(InvalidBDM):
 class InvalidBDMVolume(InvalidBDM):
     message = _("Block Device Mapping is Invalid: "
                 "failed to get volume %(id)s.")
+
+
+class InvalidBDMFormat(InvalidBDM):
+    message = _("Block Device Mapping is Invalid: "
+                "some fields are not recognized, "
+                "or have invalid values.")
+
+
+class InvalidBDMForLegacy(InvalidBDM):
+    message = _("Block Device Mapping cannot "
+                "be converted to legacy format. ")
 
 
 class VolumeUnattached(Invalid):
@@ -452,10 +451,6 @@ class InvalidID(Invalid):
     message = _("Invalid ID received %(id)s.")
 
 
-class InvalidPeriodicTaskArg(Invalid):
-    message = _("Unexpected argument for periodic task creation: %(arg)s.")
-
-
 class ConstraintNotMet(NovaException):
     message = _("Constraint not met.")
     code = 412
@@ -468,6 +463,11 @@ class NotFound(NovaException):
 
 class AgentBuildNotFound(NotFound):
     message = _("No agent-build associated with id %(id)s.")
+
+
+class AgentBuildExists(Duplicate):
+    message = _("Agent-build with hypervisor %(hypervisor)s os %(os)s "
+                "architecture %(architecture)s exists.")
 
 
 class VolumeNotFound(NotFound):
@@ -558,6 +558,11 @@ class NetworkNotFoundForProject(NotFound):
                 "is not assigned to the project %(project_id)s.")
 
 
+class NetworkAmbiguous(Invalid):
+    message = _("More than one possible network found. Specify "
+                "network ID(s) to select which one(s) to connect to,")
+
+
 class DatastoreNotFound(NotFound):
     message = _("Could not find the datastore reference(s) which the VM uses.")
 
@@ -572,6 +577,10 @@ class PortNotUsable(NovaException):
 
 class PortNotFree(NovaException):
     message = _("No free port available for instance %(instance)s.")
+
+
+class FixedIpExists(Duplicate):
+    message = _("Fixed ip %(address)s already exists.")
 
 
 class FixedIpNotFound(NotFound):
@@ -620,11 +629,6 @@ class NoMoreFixedIps(NovaException):
 
 class NoFixedIpsDefined(NotFound):
     message = _("Zero fixed ips could be found.")
-
-
-#TODO(bcwaldon): EOL this exception!
-class Duplicate(NovaException):
-    pass
 
 
 class FloatingIpExists(Duplicate):
@@ -678,19 +682,23 @@ class NoFloatingIpInterface(NotFound):
 
 
 class CannotDisassociateAutoAssignedFloatingIP(NovaException):
-    message = _("Cannot disassociate auto assigined floating ip")
+    message = _("Cannot disassociate auto assigned floating ip")
 
 
 class KeypairNotFound(NotFound):
     message = _("Keypair %(name)s not found for user %(user_id)s")
 
 
-class CertificateNotFound(NotFound):
-    message = _("Certificate %(certificate_id)s not found.")
-
-
 class ServiceNotFound(NotFound):
     message = _("Service %(service_id)s could not be found.")
+
+
+class ServiceBinaryExists(Duplicate):
+    message = _("Service with host %(host)s binary %(binary)s exists.")
+
+
+class ServiceTopicExists(Duplicate):
+    message = _("Service with host %(host)s topic %(topic)s exists.")
 
 
 class HostNotFound(NotFound):
@@ -716,6 +724,11 @@ class InvalidQuotaValue(Invalid):
 
 class QuotaNotFound(NotFound):
     message = _("Quota could not be found")
+
+
+class QuotaExists(Duplicate):
+    message = _("Quota exists for project %(project_id)s, "
+                "resource %(resource)s")
 
 
 class QuotaResourceUnknown(QuotaNotFound):
@@ -755,6 +768,11 @@ class SecurityGroupNotFoundForRule(SecurityGroupNotFound):
     message = _("Security group with rule %(rule_id)s not found.")
 
 
+class SecurityGroupExists(Invalid):
+    message = _("Security group %(security_group_name)s already exists "
+                "for project %(project_id)s.")
+
+
 class SecurityGroupExistsForInstance(Invalid):
     message = _("Security group %(security_group_id)s is already associated"
                 " with the instance %(instance_id)s")
@@ -790,6 +808,12 @@ class MigrationNotFoundByStatus(MigrationNotFound):
 
 class ConsolePoolNotFound(NotFound):
     message = _("Console pool %(pool_id)s could not be found.")
+
+
+class ConsolePoolExists(Duplicate):
+    message = _("Console pool with host %(host)s, console_type "
+                "%(console_type)s and compute_host %(compute_host)s "
+                "already exists.")
 
 
 class ConsolePoolNotFoundForHostType(NotFound):
@@ -835,6 +859,10 @@ class FlavorAccessNotFound(NotFound):
 
 class CellNotFound(NotFound):
     message = _("Cell %(cell_name)s doesn't exist.")
+
+
+class CellExists(Duplicate):
+    message = _("Cell with name %(name)s already exists.")
 
 
 class CellRoutingInconsistency(NovaException):
@@ -918,7 +946,7 @@ class RotationRequiredForBackup(NovaException):
 
 
 class KeyPairExists(Duplicate):
-    message = _("Key pair %(key_name)s already exists.")
+    message = _("Key pair '%(key_name)s' already exists.")
 
 
 class InstanceExists(Duplicate):
@@ -934,7 +962,7 @@ class InstanceTypeIdExists(Duplicate):
 
 
 class FlavorAccessExists(Duplicate):
-    message = _("Flavor access alreay exists for flavor %(flavor_id)s "
+    message = _("Flavor access already exists for flavor %(flavor_id)s "
                 "and project %(project_id)s combination.")
 
 
@@ -948,6 +976,10 @@ class InvalidLocalStorage(NovaException):
 
 class MigrationError(NovaException):
     message = _("Migration error") + ": %(reason)s"
+
+
+class MigrationPreCheckError(MigrationError):
+    message = _("Migration pre-check error") + ": %(reason)s"
 
 
 class MalformedRequestBody(NovaException):
@@ -972,8 +1004,8 @@ class ResizeError(NovaException):
     message = _("Resize error: %(reason)s")
 
 
-class ImageTooLarge(NovaException):
-    message = _("Image is larger than instance type allows")
+class CannotResizeDisk(NovaException):
+    message = _("Server disk was unable to be resized because: %(reason)s")
 
 
 class InstanceTypeMemoryTooSmall(NovaException):
@@ -986,10 +1018,6 @@ class InstanceTypeDiskTooSmall(NovaException):
 
 class InsufficientFreeMemory(NovaException):
     message = _("Insufficient free memory on compute node to start %(uuid)s.")
-
-
-class CouldNotFetchMetrics(NovaException):
-    message = _("Could not fetch bandwidth/cpu/disk metrics for this host.")
 
 
 class NoValidHost(NovaException):
@@ -1130,6 +1158,10 @@ class InstanceIsLocked(InstanceInvalidState):
     message = _("Instance %(instance_uuid)s is locked")
 
 
+class ConfigDriveInvalidValue(Invalid):
+    message = _("Invalid value for Config Drive option: %(option)s")
+
+
 class ConfigDriveMountFailed(NovaException):
     message = _("Could not mount vfat config drive. %(operation)s failed. "
                 "Error: %(error)s")
@@ -1172,6 +1204,11 @@ class InstanceActionEventNotFound(NovaException):
     message = _("Event %(event)s not found for action id %(action_id)s")
 
 
+class UnexpectedVMStateError(NovaException):
+    message = _("unexpected VM state: expecting %(expected)s but "
+                "the actual state is %(actual)s")
+
+
 class CryptoCAFileNotFound(FileNotFound):
     message = _("The CA file for %(project)s could not be found")
 
@@ -1185,7 +1222,7 @@ class InstanceRecreateNotSupported(Invalid):
 
 
 class ServiceGroupUnavailable(NovaException):
-    message = _("The service from servicegroup driver %(driver) is "
+    message = _("The service from servicegroup driver %(driver)s is "
                 "temporarily unavailable.")
 
 
@@ -1215,3 +1252,65 @@ class BuildAbortException(NovaException):
 class RescheduledException(NovaException):
     message = _("Build of instance %(instance_uuid)s was re-scheduled: "
                 "%(reason)s")
+
+
+class ShadowTableExists(NovaException):
+    message = _("Shadow table with name %(name)s already exists.")
+
+
+class InstanceFaultRollback(NovaException):
+    def __init__(self, inner_exception=None):
+        message = _("Instance rollback performed due to: %s")
+        self.inner_exception = inner_exception
+        super(InstanceFaultRollback, self).__init__(message % inner_exception)
+
+
+class UnsupportedObjectError(NovaException):
+    message = _('Unsupported object type %(objtype)s')
+
+
+class OrphanedObjectError(NovaException):
+    message = _('Cannot call %(method)s on orphaned %(objtype)s object')
+
+
+class IncompatibleObjectVersion(NovaException):
+    message = _('Version %(objver)s of %(objname)s is not supported')
+
+
+class CoreAPIMissing(NovaException):
+    message = _("Core API extensions are missing: %(missing_apis)s")
+
+
+class AgentError(NovaException):
+    message = _('Error during following call to agent: %(method)s')
+
+
+class AgentTimeout(AgentError):
+    message = _('Unable to contact guest agent. '
+                'The following call timed out: %(method)s')
+
+
+class AgentNotImplemented(AgentError):
+    message = _('Agent does not support the call: %(method)s')
+
+
+class InstanceGroupNotFound(NotFound):
+    message = _("Instance group %(group_uuid)s could not be found.")
+
+
+class InstanceGroupIdExists(Duplicate):
+    message = _("Instance group %(group_uuid)s already exists.")
+
+
+class InstanceGroupMetadataNotFound(NotFound):
+    message = _("Instance group %(group_uuid)s has no metadata with "
+                "key %(metadata_key)s.")
+
+
+class InstanceGroupMemberNotFound(NotFound):
+    message = _("Instance group %(group_uuid)s has no member with "
+                "id %(instance_id)s.")
+
+
+class InstanceGroupPolicyNotFound(NotFound):
+    message = _("Instance group %(group_uuid)s has no policy %(policy)s.")

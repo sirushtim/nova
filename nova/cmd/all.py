@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright 2011 OpenStack Foundation
@@ -50,19 +49,19 @@ def main():
     logging.setup("nova")
     LOG = logging.getLogger('nova.all')
     utils.monkey_patch()
-    launcher = service.ProcessLauncher()
+    launcher = service.process_launcher()
 
     # nova-api
     for api in CONF.enabled_apis:
         try:
             server = service.WSGIService(api)
-            launcher.launch_server(server, workers=server.workers or 1)
+            launcher.launch_service(server, workers=server.workers or 1)
         except (Exception, SystemExit):
             LOG.exception(_('Failed to load %s') % '%s-api' % api)
 
     for mod in [s3server, xvp_proxy]:
         try:
-            launcher.launch_server(mod.get_wsgi_server())
+            launcher.launch_service(mod.get_wsgi_server())
         except (Exception, SystemExit):
             LOG.exception(_('Failed to load %s') % mod.__name__)
 
@@ -83,8 +82,8 @@ def main():
             manager = None
 
         try:
-            launcher.launch_server(service.Service.create(binary=binary,
-                                                          topic=topic,
+            launcher.launch_service(service.Service.create(binary=binary,
+                                                           topic=topic,
                                                           manager=manager))
         except (Exception, SystemExit):
             LOG.exception(_('Failed to load %s'), binary)

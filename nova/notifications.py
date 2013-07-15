@@ -19,9 +19,11 @@
 the system.
 """
 
+import datetime
+
 from oslo.config import cfg
 
-from nova.compute import instance_types
+from nova.compute import flavors
 import nova.context
 from nova import db
 from nova.image import glance
@@ -93,7 +95,7 @@ def send_update(context, old_instance, new_instance, service=None, host=None):
         update_with_state_change = True
     elif CONF.notify_on_state_change:
         if (CONF.notify_on_state_change.lower() == "vm_and_task_state" and
-            old_task_state != new_task_state):
+                old_task_state != new_task_state):
             # yes, the task state is changing:
             update_with_state_change = True
 
@@ -106,8 +108,12 @@ def send_update(context, old_instance, new_instance, service=None, host=None):
 
     else:
         try:
+            old_display_name = None
+            if new_instance["display_name"] != old_instance["display_name"]:
+                old_display_name = old_instance["display_name"]
             _send_instance_update_notification(context, new_instance,
-                    service=service, host=host)
+                    service=service, host=host,
+                    old_display_name=old_display_name)
         except Exception:
             LOG.exception(_("Failed to send state update notification"),
                     instance=new_instance)
@@ -137,7 +143,7 @@ def send_update_with_states(context, instance, old_vm_state, new_vm_state,
             fire_update = True
         elif CONF.notify_on_state_change:
             if (CONF.notify_on_state_change.lower() == "vm_and_task_state" and
-                old_task_state != new_task_state):
+                    old_task_state != new_task_state):
                 # yes, the task state is changing:
                 fire_update = True
 
@@ -155,9 +161,10 @@ def send_update_with_states(context, instance, old_vm_state, new_vm_state,
 
 def _send_instance_update_notification(context, instance, old_vm_state=None,
             old_task_state=None, new_vm_state=None, new_task_state=None,
-            service="compute", host=None):
+            service="compute", host=None, old_display_name=None):
     """Send 'compute.instance.update' notification to inform observers
-    about instance state changes"""
+    about instance state changes.
+    """
 
     payload = info_from_instance(context, instance, None, None)
 
@@ -183,6 +190,10 @@ def _send_instance_update_notification(context, instance, old_vm_state=None,
     # add bw usage info:
     bw = bandwidth_usage(instance, audit_start)
     payload["bandwidth"] = bw
+
+    # add old display name if it is changed
+    if old_display_name:
+        payload["old_display_name"] = old_display_name
 
     publisher_id = notifier_api.publisher_id(service, host)
 
@@ -218,7 +229,7 @@ def bandwidth_usage(instance_ref, audit_start,
     admin_context = nova.context.get_admin_context(read_deleted='yes')
 
     if (instance_ref.get('info_cache') and
-        instance_ref['info_cache'].get('network_info') is not None):
+            instance_ref['info_cache'].get('network_info') is not None):
 
         cached_info = instance_ref['info_cache']['network_info']
         nw_info = network_model.NetworkInfo.hydrate(cached_info)
@@ -282,14 +293,19 @@ def info_from_instance(context, instance_ref, network_info,
     def null_safe_str(s):
         return str(s) if s else ''
 
+    def null_safe_isotime(s):
+        if isinstance(s, datetime.datetime):
+            return timeutils.strtime(s)
+        else:
+            return str(s) if s else ''
+
     image_ref_url = glance.generate_image_url(instance_ref['image_ref'])
 
-    instance_type = instance_types.extract_instance_type(instance_ref)
+    instance_type = flavors.extract_flavor(instance_ref)
     instance_type_name = instance_type.get('name', '')
 
     if system_metadata is None:
-        system_metadata = utils.metadata_to_dict(
-                instance_ref['system_metadata'])
+        system_metadata = utils.instance_sys_meta(instance_ref)
 
     instance_info = dict(
         # Owner properties
@@ -319,6 +335,7 @@ def info_from_instance(context, instance_ref, network_info,
 
         # Location properties
         host=instance_ref['host'],
+        node=instance_ref['node'],
         availability_zone=instance_ref['availability_zone'],
 
         # Date properties
@@ -326,8 +343,8 @@ def info_from_instance(context, instance_ref, network_info,
         # Nova's deleted vs terminated instance terminology is confusing,
         # this should be when the instance was deleted (i.e. terminated_at),
         # not when the db record was deleted. (mdragon)
-        deleted_at=null_safe_str(instance_ref.get('terminated_at')),
-        launched_at=null_safe_str(instance_ref.get('launched_at')),
+        deleted_at=null_safe_isotime(instance_ref.get('terminated_at')),
+        launched_at=null_safe_isotime(instance_ref.get('launched_at')),
 
         # Image properties
         image_ref_url=image_ref_url,

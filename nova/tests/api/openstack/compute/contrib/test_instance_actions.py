@@ -27,6 +27,7 @@ from nova import exception
 from nova.openstack.common import policy
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_instance
 from nova.tests import fake_instance_actions
 
 FAKE_UUID = fake_instance_actions.FAKE_UUID
@@ -60,9 +61,11 @@ class InstanceActionsPolicyTest(test.TestCase):
                                policy.parse_rule('project_id:%(project_id)s')})
         policy.set_rules(rules)
 
-        def fake_instance_get_by_uuid(context, instance_id):
-            return {'name': 'fake', 'project_id': '%s_unequal' %
-                                                            context.project_id}
+        def fake_instance_get_by_uuid(context, instance_id,
+                                      columns_to_join=None):
+            return fake_instance.fake_db_instance(
+                **{'name': 'fake', 'project_id': '%s_unequal' %
+                       context.project_id})
 
         self.stubs.Set(db, 'instance_get_by_uuid', fake_instance_get_by_uuid)
         req = fakes.HTTPRequest.blank('/v2/123/servers/12/os-instance-actions')
@@ -75,9 +78,11 @@ class InstanceActionsPolicyTest(test.TestCase):
                                policy.parse_rule('project_id:%(project_id)s')})
         policy.set_rules(rules)
 
-        def fake_instance_get_by_uuid(context, instance_id):
-            return {'name': 'fake', 'project_id': '%s_unequal' %
-                                                            context.project_id}
+        def fake_instance_get_by_uuid(context, instance_id,
+                                      columns_to_join=None):
+            return fake_instance.fake_db_instance(
+                **{'name': 'fake', 'project_id': '%s_unequal' %
+                       context.project_id})
 
         self.stubs.Set(db, 'instance_get_by_uuid', fake_instance_get_by_uuid)
         req = fakes.HTTPRequest.blank(
@@ -177,6 +182,14 @@ class InstanceActionsTest(test.TestCase):
                                 '/v2/123/servers/12/os-instance-actions/1')
         self.assertRaises(exc.HTTPNotFound, self.controller.show, req,
                           FAKE_UUID, FAKE_REQUEST_ID)
+
+    def test_instance_not_found(self):
+        def fake_get(self, context, instance_uuid):
+            raise exception.InstanceNotFound(instance_id=instance_uuid)
+        self.stubs.Set(compute_api.API, 'get', fake_get)
+        req = fakes.HTTPRequest.blank('/v2/123/servers/12/os-instance-actions')
+        self.assertRaises(exc.HTTPNotFound, self.controller.index, req,
+                          FAKE_UUID)
 
 
 class InstanceActionsSerializerTest(test.TestCase):

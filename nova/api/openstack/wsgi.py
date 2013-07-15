@@ -254,7 +254,7 @@ class XMLDeserializer(TextDeserializer):
         for node in parent.childNodes:
             if (node.localName == name and
                 node.namespaceURI and
-                node.namespaceURI == namespace):
+                    node.namespaceURI == namespace):
                 return node
         return None
 
@@ -817,7 +817,11 @@ class Resource(wsgi.Application):
         except (KeyError, TypeError):
             raise exception.InvalidContentType(content_type=content_type)
 
-        return deserializer().deserialize(body)
+        if (hasattr(deserializer, 'want_controller')
+                and deserializer.want_controller):
+            return deserializer(self.controller).deserialize(body)
+        else:
+            return deserializer().deserialize(body)
 
     def pre_process_extensions(self, extensions, request, action_args):
         # List of callables for post-processing extensions
@@ -916,7 +920,10 @@ class Resource(wsgi.Application):
             return Fault(webob.exc.HTTPBadRequest(explanation=msg))
 
         if body:
-            LOG.debug(_("Action: '%(action)s', body: %(body)s") % locals())
+            msg = _("Action: '%(action)s', body: "
+                    "%(body)s") % {'action': action,
+                                   'body': unicode(body, 'utf-8')}
+            LOG.debug(msg)
         LOG.debug(_("Calling method %s") % meth)
 
         # Now, deserialize the request body...
@@ -938,7 +945,11 @@ class Resource(wsgi.Application):
         project_id = action_args.pop("project_id", None)
         context = request.environ.get('nova.context')
         if (context and project_id and (project_id != context.project_id)):
-            msg = _("Malformed request url")
+            msg = _("Malformed request URL: URL's project_id '%(project_id)s'"
+                    " doesn't match Context's project_id"
+                    " '%(context_project_id)s'") % \
+                    {'project_id': project_id,
+                     'context_project_id': context.project_id}
             return Fault(webob.exc.HTTPBadRequest(explanation=msg))
 
         # Run pre-processing extensions
@@ -965,7 +976,6 @@ class Resource(wsgi.Application):
 
             # Run post-processing extensions
             if resp_obj:
-                _set_request_id_header(request, resp_obj)
                 # Do a preserialize to set up the response object
                 serializers = getattr(meth, 'wsgi_serializers', {})
                 resp_obj._bind_method_serializers(serializers)
@@ -980,6 +990,9 @@ class Resource(wsgi.Application):
             if resp_obj and not response:
                 response = resp_obj.serialize(request, accept,
                                               self.default_serializers)
+
+        if context and hasattr(response, 'headers'):
+            response.headers.add('x-compute-request-id', context.request_id)
 
         return response
 
@@ -1007,7 +1020,7 @@ class Resource(wsgi.Application):
                 meth = getattr(self.controller, action)
         except AttributeError:
             if (not self.wsgi_actions or
-                action not in _ROUTES_METHODS + ['action']):
+                    action not in _ROUTES_METHODS + ['action']):
                 # Propagate the error
                 raise
         else:

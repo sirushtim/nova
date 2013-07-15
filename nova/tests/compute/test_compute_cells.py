@@ -145,9 +145,6 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
     def test_instance_metadata(self):
         self.skipTest("Test is incompatible with cells.")
 
-    def test_live_migrate(self):
-        self.skipTest("Test is incompatible with cells.")
-
     def test_snapshot_given_image_uuid(self):
         self.skipTest("Test doesn't apply to API cell.")
 
@@ -216,6 +213,19 @@ class CellsComputeAPITestCase(test_compute.ComputeAPITestCase):
                 inst, 'soft')
         self.mox.ReplayAll()
         self.compute_api.soft_delete(self.context, inst)
+
+    def test_get_migrations(self):
+        filters = {'cell_name': 'ChildCell', 'status': 'confirmed'}
+        migrations = {'migrations': [{'id': 1234}]}
+        cells_rpcapi = self.compute_api.cells_rpcapi
+        self.mox.StubOutWithMock(cells_rpcapi, 'get_migrations')
+        cells_rpcapi.get_migrations(self.context,
+                                        filters).AndReturn(migrations)
+        self.mox.ReplayAll()
+
+        response = self.compute_api.get_migrations(self.context, filters)
+
+        self.assertEqual(migrations, response)
 
 
 class CellsComputePolicyTestCase(test_compute.ComputePolicyTestCase):

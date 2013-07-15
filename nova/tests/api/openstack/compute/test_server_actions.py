@@ -30,6 +30,7 @@ from nova.image import glance
 from nova.openstack.common import importutils
 from nova import test
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_instance
 from nova.tests.image import fake
 from nova.tests import matchers
 from nova.tests import utils
@@ -191,6 +192,34 @@ class ServerActionsControllerTest(test.TestCase):
         self.stubs.Set(compute_api.API, 'reboot', fake_reboot)
 
         req = fakes.HTTPRequest.blank(self.url)
+        self.assertRaises(webob.exc.HTTPConflict,
+                          self.controller._action_reboot,
+                          req, FAKE_UUID, body)
+
+    def test_reboot_soft_with_soft_in_progress_raises_conflict(self):
+        body = dict(reboot=dict(type="SOFT"))
+        req = fakes.HTTPRequest.blank(self.url)
+        self.stubs.Set(db, 'instance_get_by_uuid',
+                       fakes.fake_instance_get(vm_state=vm_states.ACTIVE,
+                                            task_state=task_states.REBOOTING))
+        self.assertRaises(webob.exc.HTTPConflict,
+                          self.controller._action_reboot,
+                          req, FAKE_UUID, body)
+
+    def test_reboot_hard_with_soft_in_progress_does_not_raise(self):
+        body = dict(reboot=dict(type="HARD"))
+        req = fakes.HTTPRequest.blank(self.url)
+        self.stubs.Set(db, 'instance_get_by_uuid',
+                       fakes.fake_instance_get(vm_state=vm_states.ACTIVE,
+                                        task_state=task_states.REBOOTING))
+        self.controller._action_reboot(req, FAKE_UUID, body)
+
+    def test_reboot_hard_with_hard_in_progress_raises_conflict(self):
+        body = dict(reboot=dict(type="HARD"))
+        req = fakes.HTTPRequest.blank(self.url)
+        self.stubs.Set(db, 'instance_get_by_uuid',
+                       fakes.fake_instance_get(vm_state=vm_states.ACTIVE,
+                                        task_state=task_states.REBOOTING_HARD))
         self.assertRaises(webob.exc.HTTPConflict,
                           self.controller._action_reboot,
                           req, FAKE_UUID, body)
@@ -439,7 +468,7 @@ class ServerActionsControllerTest(test.TestCase):
         self.assertTrue('adminPass' not in body['server'])
 
     def test_rebuild_server_not_found(self):
-        def server_not_found(self, instance_id):
+        def server_not_found(self, instance_id, columns_to_join=None):
             raise exception.InstanceNotFound(instance_id=instance_id)
         self.stubs.Set(db, 'instance_get_by_uuid', server_not_found)
 
@@ -602,6 +631,34 @@ class ServerActionsControllerTest(test.TestCase):
                           self.controller._action_resize,
                           req, FAKE_UUID, body)
 
+    def test_resize_with_image_exceptions(self):
+        body = dict(resize=dict(flavorRef="http://localhost/3"))
+        self.resize_called = 0
+        image_id = 'fake_image_id'
+
+        exceptions = [
+            (exception.ImageNotAuthorized(image_id=image_id),
+             webob.exc.HTTPUnauthorized),
+            (exception.ImageNotFound(image_id=image_id),
+             webob.exc.HTTPBadRequest),
+            (exception.Invalid, webob.exc.HTTPBadRequest),
+        ]
+
+        raised, expected = map(iter, zip(*exceptions))
+
+        def _fake_resize(obj, context, instance, flavor_id):
+            self.resize_called += 1
+            raise raised.next()
+
+        self.stubs.Set(compute_api.API, 'resize', _fake_resize)
+
+        for call_no in range(len(exceptions)):
+            req = fakes.HTTPRequest.blank(self.url)
+            self.assertRaises(expected.next(),
+                              self.controller._action_resize,
+                              req, FAKE_UUID, body)
+            self.assertEqual(self.resize_called, call_no + 1)
+
     def test_resize_with_too_many_instances(self):
         body = dict(resize=dict(flavorRef="http://localhost/3"))
 
@@ -745,6 +802,19 @@ class ServerActionsControllerTest(test.TestCase):
         location = response.headers['Location']
         self.assertEqual('http://localhost/v2/fake/images/123', location)
 
+    def test_create_image_name_too_long(self):
+        long_name = 'a' * 260
+        body = {
+            'createImage': {
+                'name': long_name,
+            },
+        }
+
+        req = fakes.HTTPRequest.blank(self.url)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller._action_create_image, req,
+                          FAKE_UUID, body)
+
     def _do_test_create_volume_backed_image(self, extra_properties):
 
         def _fake_id(x):
@@ -774,7 +844,8 @@ class ServerActionsControllerTest(test.TestCase):
 
         def fake_block_device_mapping_get_all_by_instance(context, inst_id):
             return [dict(volume_id=_fake_id('a'),
-                         virtual_name=None,
+                         source_type='snapshot',
+                         destination_type='volume',
                          volume_size=1,
                          device_name='vda',
                          snapshot_id=1,
@@ -797,7 +868,7 @@ class ServerActionsControllerTest(test.TestCase):
         self.mox.StubOutWithMock(self.controller.compute_api, 'volume_api')
         volume_api = self.controller.compute_api.volume_api
         volume_api.get(mox.IgnoreArg(), volume['id']).AndReturn(volume)
-        volume_api.create_snapshot_force(mox.IgnoreArg(), volume,
+        volume_api.create_snapshot_force(mox.IgnoreArg(), volume['id'],
                 mox.IgnoreArg(), mox.IgnoreArg()).AndReturn(snapshot)
 
         self.mox.ReplayAll()
@@ -923,10 +994,10 @@ class ServerActionsControllerTest(test.TestCase):
                           req, FAKE_UUID, body)
 
     def test_locked(self):
-        def fake_locked(context, instance_uuid):
-            return {"name": "foo",
-                    "uuid": FAKE_UUID,
-                    "locked": True}
+        def fake_locked(context, instance_uuid, columns_to_join=None):
+            return fake_instance.fake_db_instance(name="foo",
+                                                  uuid=FAKE_UUID,
+                                                  locked=True)
         self.stubs.Set(db, 'instance_get_by_uuid', fake_locked)
         body = dict(reboot=dict(type="HARD"))
         req = fakes.HTTPRequest.blank(self.url)

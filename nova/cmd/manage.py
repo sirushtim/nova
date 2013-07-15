@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
@@ -54,18 +53,16 @@
   CLI interface for nova management.
 """
 
-import gettext
 import netaddr
 import os
 import sys
 
 from oslo.config import cfg
 
-gettext.install('nova', unicode=1)
-
 from nova.api.ec2 import ec2utils
 from nova import availability_zones
-from nova.compute import instance_types
+from nova.cells import rpc_driver
+from nova.compute import flavors
 from nova import config
 from nova import context
 from nova import db
@@ -76,9 +73,7 @@ from nova.openstack.common.db import exception as db_exc
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
 from nova.openstack.common import rpc
-from nova.openstack.common import timeutils
 from nova import quota
-from nova.scheduler import rpcapi as scheduler_rpcapi
 from nova import servicegroup
 from nova import version
 
@@ -144,19 +139,22 @@ class ShellCommands(object):
     def bpython(self):
         """Runs a bpython shell.
 
-        Falls back to Ipython/python shell if unavailable"""
+        Falls back to Ipython/python shell if unavailable
+        """
         self.run('bpython')
 
     def ipython(self):
         """Runs an Ipython shell.
 
-        Falls back to Python shell if unavailable"""
+        Falls back to Python shell if unavailable
+        """
         self.run('ipython')
 
     def python(self):
         """Runs a python shell.
 
-        Falls back to Python shell if unavailable"""
+        Falls back to Python shell if unavailable
+        """
         self.run('python')
 
     @args('--shell', metavar='<bpython|ipython|python >',
@@ -198,7 +196,9 @@ class ShellCommands(object):
     @args('--path', metavar='<path>', help='Script path')
     def script(self, path):
         """Runs the script from the specified path with flags set properly.
-        arguments: path"""
+
+        arguments: path
+        """
         exec(compile(open(path).read(), path, 'exec'), locals(), globals())
 
 
@@ -235,9 +235,9 @@ class ProjectCommands(object):
                 if value.lower() == 'unlimited':
                     value = -1
                 try:
-                    db.quota_update(ctxt, project_id, key, value)
-                except exception.ProjectQuotaNotFound:
                     db.quota_create(ctxt, project_id, key, value)
+                except exception.QuotaExists:
+                    db.quota_update(ctxt, project_id, key, value)
             else:
                 print _('%(key)s is not a valid quota key. Valid options are: '
                         '%(options)s.') % {'key': key,
@@ -340,13 +340,17 @@ class FixedIpCommands(object):
     @args('--address', metavar='<ip address>', help='IP address')
     def reserve(self, address):
         """Mark fixed ip as reserved
-        arguments: address"""
+
+        arguments: address
+        """
         return self._set_reserved(address, True)
 
     @args('--address', metavar='<ip address>', help='IP address')
     def unreserve(self, address):
         """Mark fixed ip as free to use
-        arguments: address"""
+
+        arguments: address
+        """
         return self._set_reserved(address, False)
 
     def _set_reserved(self, address, reserved):
@@ -426,8 +430,10 @@ class FloatingIpCommands(object):
 
     @args('--host', metavar='<host>', help='Host')
     def list(self, host=None):
-        """Lists all floating ips (optionally by host)
-        Note: if host is given, only active floating IPs are returned"""
+        """Lists all floating ips (optionally by host).
+
+        Note: if host is given, only active floating IPs are returned
+        """
         ctxt = context.get_admin_context()
         try:
             if host is None:
@@ -534,13 +540,13 @@ class NetworkCommands(object):
             raise Exception(_("Please specify either fixed_range or uuid"))
 
         net_manager = importutils.import_object(CONF.network_manager)
-        if "QuantumManager" in CONF.network_manager:
+        if "NeutronManager" in CONF.network_manager:
             if uuid is None:
                 raise Exception(_("UUID is required to delete "
-                                  "Quantum Networks"))
+                                  "Neutron Networks"))
             if fixed_range:
                 raise Exception(_("Deleting by fixed_range is not supported "
-                                "with the QuantumManager"))
+                                "with the NeutronManager"))
         # delete the network
         net_manager.delete_network(context.get_admin_context(),
             fixed_range, uuid)
@@ -622,7 +628,7 @@ class VmCommands(object):
                            context.get_admin_context(), host)
 
         for instance in instances:
-            instance_type = instance_types.extract_instance_type(instance)
+            instance_type = flavors.extract_flavor(instance)
             print ("%-10s %-15s %-10s %-10s %-26s %-9s %-9s %-9s"
                    " %-10s %-10s %-10s %-5d" % (instance['display_name'],
                                                 instance['host'],
@@ -649,7 +655,6 @@ class ServiceCommands(object):
         """
         servicegroup_api = servicegroup.API()
         ctxt = context.get_admin_context()
-        now = timeutils.utcnow()
         services = db.service_get_all(ctxt)
         services = availability_zones.set_availability_zones(ctxt, services)
         if host:
@@ -700,6 +705,60 @@ class ServiceCommands(object):
             return(2)
         print _("Service %(service)s on host %(host)s disabled.") % locals()
 
+    def _show_host_resources(self, context, host):
+        """Shows the physical/usage resource given by hosts.
+
+        :param context: security context
+        :param host: hostname
+        :returns:
+            example format is below::
+
+                {'resource':D, 'usage':{proj_id1:D, proj_id2:D}}
+                D: {'vcpus': 3, 'memory_mb': 2048, 'local_gb': 2048,
+                    'vcpus_used': 12, 'memory_mb_used': 10240,
+                    'local_gb_used': 64}
+
+        """
+        # Getting compute node info and related instances info
+        service_ref = db.service_get_by_compute_host(context, host)
+        instance_refs = db.instance_get_all_by_host(context,
+                                                    service_ref['host'])
+
+        # Getting total available/used resource
+        compute_ref = service_ref['compute_node'][0]
+        resource = {'vcpus': compute_ref['vcpus'],
+                    'memory_mb': compute_ref['memory_mb'],
+                    'local_gb': compute_ref['local_gb'],
+                    'vcpus_used': compute_ref['vcpus_used'],
+                    'memory_mb_used': compute_ref['memory_mb_used'],
+                    'local_gb_used': compute_ref['local_gb_used']}
+        usage = dict()
+        if not instance_refs:
+            return {'resource': resource, 'usage': usage}
+
+        # Getting usage resource per project
+        project_ids = [i['project_id'] for i in instance_refs]
+        project_ids = list(set(project_ids))
+        for project_id in project_ids:
+            vcpus = [i['vcpus'] for i in instance_refs
+                     if i['project_id'] == project_id]
+
+            mem = [i['memory_mb'] for i in instance_refs
+                   if i['project_id'] == project_id]
+
+            root = [i['root_gb'] for i in instance_refs
+                    if i['project_id'] == project_id]
+
+            ephemeral = [i['ephemeral_gb'] for i in instance_refs
+                         if i['project_id'] == project_id]
+
+            usage[project_id] = {'vcpus': sum(vcpus),
+                                 'memory_mb': sum(mem),
+                                 'root_gb': sum(root),
+                                 'ephemeral_gb': sum(ephemeral)}
+
+        return {'resource': resource, 'usage': usage}
+
     @args('--host', metavar='<host>', help='Host')
     def describe_resource(self, host):
         """Describes cpu/memory/hdd info for host.
@@ -707,9 +766,8 @@ class ServiceCommands(object):
         :param host: hostname.
 
         """
-        rpcapi = scheduler_rpcapi.SchedulerAPI()
-        result = rpcapi.show_host_resources(context.get_admin_context(),
-                                            host=host)
+        result = self._show_host_resources(context.get_admin_context(),
+                                           host=host)
 
         if not isinstance(result, dict):
             print _('An unexpected error has occurred.')
@@ -762,7 +820,8 @@ class HostCommands(object):
 
     def list(self, zone=None):
         """Show a list of all physical hosts. Filter by zone.
-        args: [zone]"""
+        args: [zone]
+        """
         print "%-25s\t%-15s" % (_('host'),
                                 _('zone'))
         ctxt = context.get_admin_context()
@@ -837,9 +896,10 @@ class InstanceTypeCommands(object):
                flavorid=None, swap=0, rxtx_factor=1.0, is_public=True):
         """Creates instance types / flavors."""
         try:
-            instance_types.create(name, memory, vcpus, root_gb,
-                                  ephemeral_gb, flavorid, swap, rxtx_factor,
-                                  is_public)
+            flavors.create(name, memory, vcpus, root_gb,
+                           ephemeral_gb=ephemeral_gb, flavorid=flavorid,
+                           swap=swap, rxtx_factor=rxtx_factor,
+                           is_public=is_public)
         except exception.InvalidInput as e:
             print _("Must supply valid parameters to create instance_type")
             print e
@@ -862,7 +922,7 @@ class InstanceTypeCommands(object):
     def delete(self, name):
         """Marks instance types / flavors as deleted."""
         try:
-            instance_types.destroy(name)
+            flavors.destroy(name)
         except exception.InstanceTypeNotFound:
             print _("Valid instance type name is required")
             return(1)
@@ -879,9 +939,9 @@ class InstanceTypeCommands(object):
         """Lists all active or specific instance types / flavors."""
         try:
             if name is None:
-                inst_types = instance_types.get_all_types()
+                inst_types = flavors.get_all_flavors()
             else:
-                inst_types = instance_types.get_instance_type_by_name(name)
+                inst_types = flavors.get_flavor_by_name(name)
         except db_exc.DBError as e:
             _db_error(e)
         if isinstance(inst_types.values()[0], dict):
@@ -897,7 +957,7 @@ class InstanceTypeCommands(object):
         """Add key/value pair to specified instance type's extra_specs."""
         try:
             try:
-                inst_type = instance_types.get_instance_type_by_name(name)
+                inst_type = flavors.get_flavor_by_name(name)
             except exception.InstanceTypeNotFoundByName as e:
                 print e
                 return(2)
@@ -919,7 +979,7 @@ class InstanceTypeCommands(object):
         """Delete the specified extra spec for instance type."""
         try:
             try:
-                inst_type = instance_types.get_instance_type_by_name(name)
+                inst_type = flavors.get_flavor_by_name(name)
             except exception.InstanceTypeNotFoundByName as e:
                 print e
                 return(2)
@@ -938,18 +998,30 @@ class InstanceTypeCommands(object):
 class AgentBuildCommands(object):
     """Class for managing agent builds."""
 
+    @args('--os', metavar='<os>', help='os')
+    @args('--architecture', dest='architecture',
+            metavar='<architecture>', help='architecture')
+    @args('--version', metavar='<version>', help='version')
+    @args('--url', metavar='<url>', help='url')
+    @args('--md5hash', metavar='<md5hash>', help='md5hash')
+    @args('--hypervisor', metavar='<hypervisor>',
+            help='hypervisor(default: xen)')
     def create(self, os, architecture, version, url, md5hash,
                 hypervisor='xen'):
         """Creates a new agent build."""
         ctxt = context.get_admin_context()
-        agent_build = db.agent_build_create(ctxt,
-                                            {'hypervisor': hypervisor,
-                                             'os': os,
-                                             'architecture': architecture,
-                                             'version': version,
-                                             'url': url,
-                                             'md5hash': md5hash})
+        db.agent_build_create(ctxt, {'hypervisor': hypervisor,
+                                     'os': os,
+                                     'architecture': architecture,
+                                     'version': version,
+                                     'url': url,
+                                     'md5hash': md5hash})
 
+    @args('--os', metavar='<os>', help='os')
+    @args('--architecture', dest='architecture',
+            metavar='<architecture>', help='architecture')
+    @args('--hypervisor', metavar='<hypervisor>',
+            help='hypervisor(default: xen)')
     def delete(self, os, architecture, hypervisor='xen'):
         """Deletes an existing agent build."""
         ctxt = context.get_admin_context()
@@ -957,9 +1029,13 @@ class AgentBuildCommands(object):
                                   hypervisor, os, architecture)
         db.agent_build_destroy(ctxt, agent_build_ref['id'])
 
+    @args('--hypervisor', metavar='<hypervisor>',
+            help='hypervisor(default: None)')
     def list(self, hypervisor=None):
         """Lists all agent builds.
-        arguments: <none>"""
+
+        arguments: <none>
+        """
         fmt = "%-10s  %-8s  %12s  %s"
         ctxt = context.get_admin_context()
         by_hypervisor = {}
@@ -983,6 +1059,14 @@ class AgentBuildCommands(object):
 
             print
 
+    @args('--os', metavar='<os>', help='os')
+    @args('--architecture', dest='architecture',
+            metavar='<architecture>', help='architecture')
+    @args('--version', metavar='<version>', help='version')
+    @args('--url', metavar='<url>', help='url')
+    @args('--md5hash', metavar='<md5hash>', help='md5hash')
+    @args('--hypervisor', metavar='<hypervisor>',
+            help='hypervisor(default: xen)')
     def modify(self, os, architecture, version, url, md5hash,
                hypervisor='xen'):
         """Update an existing agent build."""
@@ -1019,6 +1103,8 @@ class GetLogCommands(object):
         if error_found == 0:
             print _('No errors in logfiles!')
 
+    @args('--num_entries', metavar='<number of entries>',
+            help='number of entries(default: 10)')
     def syslog(self, num_entries=10):
         """Get <num_entries> of the nova syslog events."""
         entries = int(num_entries)
@@ -1071,14 +1157,20 @@ class CellCommands(object):
             print "Error: cell type must be 'parent' or 'child'"
             return(2)
 
+        # Set up the transport URL
+        transport = {
+            'username': username,
+            'password': password,
+            'hostname': hostname,
+            'port': int(port),
+            'virtual_host': virtual_host,
+        }
+        transport_url = rpc_driver.unparse_transport_url(transport)
+
         is_parent = cell_type == 'parent'
         values = {'name': name,
                   'is_parent': is_parent,
-                  'username': username,
-                  'password': password,
-                  'rpc_host': hostname,
-                  'rpc_port': int(port),
-                  'rpc_virtual_host': virtual_host,
+                  'transport_url': transport_url,
                   'weight_offset': float(woffset),
                   'weight_scale': float(wscale)}
         ctxt = context.get_admin_context()
@@ -1099,10 +1191,11 @@ class CellCommands(object):
         print fmt % ('-' * 3, '-' * 10, '-' * 6, '-' * 10, '-' * 15,
                 '-' * 5, '-' * 10)
         for cell in cells:
+            transport = rpc_driver.parse_transport_url(cell.transport_url)
             print fmt % (cell.id, cell.name,
                     'parent' if cell.is_parent else 'child',
-                    cell.username, cell.rpc_host,
-                    cell.rpc_port, cell.rpc_virtual_host)
+                    transport['username'], transport['hostname'],
+                    transport['port'], transport['virtual_host'])
         print fmt % ('-' * 3, '-' * 10, '-' * 6, '-' * 10, '-' * 15,
                 '-' * 5, '-' * 10)
 
@@ -1129,7 +1222,9 @@ CATEGORIES = {
 
 def methods_of(obj):
     """Get all callable methods of an object that don't start with underscore
-    returns a list of tuples of the form (method_name, method)"""
+
+    returns a list of tuples of the form (method_name, method)
+    """
     result = []
     for i in dir(obj):
         if callable(getattr(obj, i)) and not i.startswith('_'):

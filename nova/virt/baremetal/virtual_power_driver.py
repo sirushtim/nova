@@ -23,7 +23,7 @@ from nova import context as nova_context
 from nova import exception
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
-from nova import utils
+from nova.openstack.common import processutils
 from nova.virt.baremetal import baremetal_states
 from nova.virt.baremetal import base
 from nova.virt.baremetal import db
@@ -59,7 +59,6 @@ CONF.register_group(baremetal_vp)
 CONF.register_opts(opts, baremetal_vp)
 
 _conn = None
-_virtual_power_settings = None
 _vp_cmd = None
 _cmds = None
 
@@ -84,7 +83,6 @@ class VirtualPowerManager(base.PowerManager):
     """
     def __init__(self, **kwargs):
         global _conn
-        global _virtual_power_settings
         global _cmds
 
         if _cmds is None:
@@ -229,11 +227,11 @@ class VirtualPowerManager(base.PowerManager):
         cmd = '%s %s' % (self._vp_cmd.base_cmd, cmd)
 
         try:
-            stdout, stderr = utils.ssh_execute(self._connection, cmd,
-                                           check_exit_code=check_exit_code)
+            stdout, stderr = processutils.ssh_execute(
+                self._connection, cmd, check_exit_code=check_exit_code)
             result = stdout.strip().splitlines()
             LOG.debug('Result for run_command: %s' % result)
-        except exception.ProcessExecutionError:
+        except processutils.ProcessExecutionError:
             result = []
             LOG.exception("Error running command: %s" % cmd)
         return result

@@ -19,15 +19,16 @@ Image caching and management.
 """
 import os
 
-from nova.compute import instance_types
+from oslo.config import cfg
+
+from nova.compute import flavors
 from nova.openstack.common import excutils
-from nova.openstack.common import lockutils
 from nova.openstack.common import log as logging
+from nova import utils
 from nova.virt.hyperv import pathutils
 from nova.virt.hyperv import vhdutils
 from nova.virt.hyperv import vmutils
 from nova.virt import images
-from oslo.config import cfg
 
 LOG = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ class ImageCache(object):
     def _get_root_vhd_size_gb(self, instance):
         try:
             # In case of resizes we need the old root disk size
-            old_instance_type = instance_types.extract_instance_type(
+            old_instance_type = flavors.extract_flavor(
                 instance, prefix='old_')
             return old_instance_type['root_gb']
         except KeyError:
@@ -65,26 +66,31 @@ class ImageCache(object):
         root_vhd_size = root_vhd_size_gb * 1024 ** 3
 
         if root_vhd_size < vhd_size:
-            raise vmutils.HyperVException(_("Cannot resize the image to a "
-                                            "size smaller than the VHD max. "
-                                            "internal size: %(vhd_size)s. "
-                                            "Requested disk size: "
-                                            "%(root_vhd_size)s") % locals())
+            raise vmutils.HyperVException(
+                _("Cannot resize the image to a size smaller than the VHD "
+                  "max. internal size: %(vhd_size)s. Requested disk size: "
+                  "%(root_vhd_size)s") %
+                {'vhd_size': vhd_size, 'root_vhd_size': root_vhd_size}
+            )
         if root_vhd_size > vhd_size:
             path_parts = os.path.splitext(vhd_path)
             resized_vhd_path = '%s_%s%s' % (path_parts[0],
                                             root_vhd_size_gb,
                                             path_parts[1])
 
-            @lockutils.synchronized(resized_vhd_path, 'nova-')
+            @utils.synchronized(resized_vhd_path)
             def copy_and_resize_vhd():
                 if not self._pathutils.exists(resized_vhd_path):
                     try:
                         LOG.debug(_("Copying VHD %(vhd_path)s to "
-                                    "%(resized_vhd_path)s") % locals())
+                                    "%(resized_vhd_path)s"),
+                                  {'vhd_path': vhd_path,
+                                   'resized_vhd_path': resized_vhd_path})
                         self._pathutils.copyfile(vhd_path, resized_vhd_path)
                         LOG.debug(_("Resizing VHD %(resized_vhd_path)s to new "
-                                    "size %(root_vhd_size)s") % locals())
+                                    "size %(root_vhd_size)s"),
+                                  {'resized_vhd_path': resized_vhd_path,
+                                   'root_vhd_size': root_vhd_size})
                         self._vhdutils.resize_vhd(resized_vhd_path,
                                                   root_vhd_size)
                     except Exception:
@@ -101,7 +107,7 @@ class ImageCache(object):
         base_vhd_dir = self._pathutils.get_base_vhd_dir()
         vhd_path = os.path.join(base_vhd_dir, image_id + ".vhd")
 
-        @lockutils.synchronized(vhd_path, 'nova-')
+        @utils.synchronized(vhd_path)
         def fetch_image_if_not_existing():
             if not self._pathutils.exists(vhd_path):
                 try:

@@ -15,7 +15,7 @@
 from lxml import etree
 import webob
 
-from nova.compute import instance_types
+from nova.compute import flavors
 from nova.openstack.common import jsonutils
 from nova import test
 from nova.tests.api.openstack import fakes
@@ -38,11 +38,12 @@ FAKE_FLAVORS = {
 }
 
 
-def fake_instance_type_get_by_flavor_id(flavorid):
+#TOD(jogo) dedup these accross nova.api.openstack.contrib.test_flavor*
+def fake_flavor_get_by_flavor_id(flavorid, ctxt=None):
     return FAKE_FLAVORS['flavor %s' % flavorid]
 
 
-def fake_instance_type_get_all(*args, **kwargs):
+def fake_flavor_get_all(*args, **kwargs):
     return FAKE_FLAVORS
 
 
@@ -56,11 +57,11 @@ class FlavorSwapTest(test.TestCase):
               '.flavor_swap.Flavor_swap')
         self.flags(osapi_compute_extension=[ext])
         fakes.stub_out_nw_api(self.stubs)
-        self.stubs.Set(instance_types, "get_all_types",
-                       fake_instance_type_get_all)
-        self.stubs.Set(instance_types,
-                       "get_instance_type_by_flavor_id",
-                       fake_instance_type_get_by_flavor_id)
+        self.stubs.Set(flavors, "get_all_flavors",
+                       fake_flavor_get_all)
+        self.stubs.Set(flavors,
+                       "get_flavor_by_flavor_id",
+                       fake_flavor_get_by_flavor_id)
 
     def _make_request(self, url):
         req = webob.Request.blank(url)

@@ -25,9 +25,6 @@ security_group_opts = [
     cfg.StrOpt('security_group_api',
                default='nova',
                help='The full class name of the security API class'),
-    cfg.StrOpt('security_group_handler',
-               default='nova.network.sg.NullSecurityGroupHandler',
-               help='The full class name of the security group handler class'),
 ]
 
 CONF = cfg.CONF
@@ -35,25 +32,18 @@ CONF.register_opts(security_group_opts)
 
 NOVA_DRIVER = ('nova.api.openstack.compute.contrib.security_groups.'
                'NativeNovaSecurityGroupAPI')
-QUANTUM_DRIVER = ('nova.api.openstack.compute.contrib.security_groups.'
-                  'NativeQuantumSecurityGroupAPI')
+NEUTRON_DRIVER = ('nova.api.openstack.compute.contrib.security_groups.'
+                  'NativeNeutronSecurityGroupAPI')
 
 
 def get_openstack_security_group_driver():
     if CONF.security_group_api.lower() == 'nova':
         return importutils.import_object(NOVA_DRIVER)
-    elif CONF.security_group_api.lower() == 'quantum':
-        return importutils.import_object(QUANTUM_DRIVER)
+    elif CONF.security_group_api.lower() in ('neutron', 'quantum'):
+        return importutils.import_object(NEUTRON_DRIVER)
     else:
         return importutils.import_object(CONF.security_group_api)
 
 
-def get_security_group_handler():
-    return importutils.import_object(CONF.security_group_handler)
-
-
-def is_quantum_security_groups():
-    if CONF.security_group_api.lower() == "quantum":
-        return True
-    else:
-        return False
+def is_neutron_security_groups():
+    return CONF.security_group_api.lower() in ('neutron', 'quantum')

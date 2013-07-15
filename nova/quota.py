@@ -105,14 +105,18 @@ class DbQuotaDriver(object):
 
     def get_defaults(self, context, resources):
         """Given a list of resources, retrieve the default quotas.
+        Use the class quotas named `_DEFAULT_QUOTA_NAME` as default quotas,
+        if it exists.
 
         :param context: The request context, for access checks.
         :param resources: A dictionary of the registered resources.
         """
 
         quotas = {}
+        default_quotas = db.quota_class_get_default(context)
         for resource in resources.values():
-            quotas[resource.name] = resource.default
+            quotas[resource.name] = default_quotas.get(resource.name,
+                                                       resource.default)
 
         return quotas
 
@@ -180,6 +184,8 @@ class DbQuotaDriver(object):
         else:
             class_quotas = {}
 
+        default_quotas = self.get_defaults(context, resources)
+
         for resource in resources.values():
             # Omit default/quota class values
             if not defaults and resource.name not in project_quotas:
@@ -187,7 +193,7 @@ class DbQuotaDriver(object):
 
             quotas[resource.name] = dict(
                 limit=project_quotas.get(resource.name, class_quotas.get(
-                        resource.name, resource.default)),
+                        resource.name, default_quotas[resource.name])),
                 )
 
             # Include usages if desired.  This is optional because one
@@ -987,6 +993,7 @@ class QuotaEngine(object):
             # logged, however, because this is less than optimal.
             LOG.exception(_("Failed to commit reservations "
                             "%(reservations)s") % locals())
+            return
         LOG.debug(_("Committed reservations %(reservations)s") % locals())
 
     def rollback(self, context, reservations, project_id=None):
@@ -1009,6 +1016,7 @@ class QuotaEngine(object):
             # logged, however, because this is less than optimal.
             LOG.exception(_("Failed to roll back reservations "
                             "%(reservations)s") % locals())
+            return
         LOG.debug(_("Rolled back reservations %(reservations)s") % locals())
 
     def usage_reset(self, context, resources):

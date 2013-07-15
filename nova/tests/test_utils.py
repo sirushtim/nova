@@ -30,129 +30,12 @@ from oslo.config import cfg
 
 import nova
 from nova import exception
+from nova.openstack.common import processutils
 from nova.openstack.common import timeutils
 from nova import test
 from nova import utils
 
 CONF = cfg.CONF
-
-
-class ByteConversionTest(test.TestCase):
-    def test_string_conversions(self):
-        working_examples = {
-            '1024KB': 1048576,
-            '1024TB': 1125899906842624,
-            '1024K': 1048576,
-            '1024T': 1125899906842624,
-            '1TB': 1099511627776,
-            '1T': 1099511627776,
-            '1KB': 1024,
-            '1K': 1024,
-            '1B': 1,
-            '1B': 1,
-            '1': 1,
-            '1MB': 1048576,
-            '7MB': 7340032,
-            '0MB': 0,
-            '0KB': 0,
-            '0TB': 0,
-            '': 0,
-        }
-        for (in_value, expected_value) in working_examples.items():
-            b_value = utils.to_bytes(in_value)
-            self.assertEquals(expected_value, b_value)
-            if len(in_value):
-                in_value = "-" + in_value
-                b_value = utils.to_bytes(in_value)
-                self.assertEquals(expected_value * -1, b_value)
-        breaking_examples = [
-            'junk1KB', '1023BBBB',
-        ]
-        for v in breaking_examples:
-            self.assertRaises(TypeError, utils.to_bytes, v)
-
-
-class ExecuteTestCase(test.TestCase):
-
-    def test_retry_on_failure(self):
-        fd, tmpfilename = tempfile.mkstemp()
-        _, tmpfilename2 = tempfile.mkstemp()
-        try:
-            fp = os.fdopen(fd, 'w+')
-            fp.write('''#!/bin/sh
-# If stdin fails to get passed during one of the runs, make a note.
-if ! grep -q foo
-then
-    echo 'failure' > "$1"
-fi
-# If stdin has failed to get passed during this or a previous run, exit early.
-if grep failure "$1"
-then
-    exit 1
-fi
-runs="$(cat $1)"
-if [ -z "$runs" ]
-then
-    runs=0
-fi
-runs=$(($runs + 1))
-echo $runs > "$1"
-exit 1
-''')
-            fp.close()
-            os.chmod(tmpfilename, 0755)
-            self.assertRaises(exception.ProcessExecutionError,
-                              utils.execute,
-                              tmpfilename, tmpfilename2, attempts=10,
-                              process_input='foo',
-                              delay_on_retry=False)
-            fp = open(tmpfilename2, 'r')
-            runs = fp.read()
-            fp.close()
-            self.assertNotEquals(runs.strip(), 'failure', 'stdin did not '
-                                                          'always get passed '
-                                                          'correctly')
-            runs = int(runs.strip())
-            self.assertEquals(runs, 10,
-                              'Ran %d times instead of 10.' % (runs,))
-        finally:
-            os.unlink(tmpfilename)
-            os.unlink(tmpfilename2)
-
-    def test_unknown_kwargs_raises_error(self):
-        self.assertRaises(exception.NovaException,
-                          utils.execute,
-                          '/usr/bin/env', 'true',
-                          this_is_not_a_valid_kwarg=True)
-
-    def test_check_exit_code_boolean(self):
-        utils.execute('/usr/bin/env', 'false', check_exit_code=False)
-        self.assertRaises(exception.ProcessExecutionError,
-                          utils.execute,
-                          '/usr/bin/env', 'false', check_exit_code=True)
-
-    def test_no_retry_on_success(self):
-        fd, tmpfilename = tempfile.mkstemp()
-        _, tmpfilename2 = tempfile.mkstemp()
-        try:
-            fp = os.fdopen(fd, 'w+')
-            fp.write('''#!/bin/sh
-# If we've already run, bail out.
-grep -q foo "$1" && exit 1
-# Mark that we've run before.
-echo foo > "$1"
-# Check that stdin gets passed correctly.
-grep foo
-''')
-            fp.close()
-            os.chmod(tmpfilename, 0755)
-            utils.execute(tmpfilename,
-                          tmpfilename2,
-                          process_input='foo',
-                          attempts=2)
-        finally:
-            os.unlink(tmpfilename)
-            os.unlink(tmpfilename2)
 
 
 class GetFromPathTestCase(test.TestCase):
@@ -310,6 +193,92 @@ class GetFromPathTestCase(test.TestCase):
         self.assertEquals(['b_1'], f(input, "a/b"))
 
 
+class GetMyIP4AddressTestCase(test.TestCase):
+    def test_get_my_ipv4_address_with_no_ipv4(self):
+        response = """172.16.0.0/16 via 172.16.251.13 dev tun1
+172.16.251.1 via 172.16.251.13 dev tun1
+172.16.251.13 dev tun1  proto kernel  scope link  src 172.16.251.14
+172.24.0.0/16 via 172.16.251.13 dev tun1
+192.168.122.0/24 dev virbr0  proto kernel  scope link  src 192.168.122.1"""
+
+        def fake_execute(*args, **kwargs):
+            return response, None
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '127.0.0.1')
+
+    def test_get_my_ipv4_address_bad_process(self):
+        def fake_execute(*args, **kwargs):
+            raise processutils.ProcessExecutionError()
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '127.0.0.1')
+
+    def test_get_my_ipv4_address_with_single_interface(self):
+        response_route = """default via 192.168.1.1 dev wlan0  proto static
+192.168.1.0/24 dev wlan0  proto kernel  scope link  src 192.168.1.137  metric 9
+"""
+        response_addr = """
+1: lo    inet 127.0.0.1/8 scope host lo
+3: wlan0    inet 192.168.1.137/24 brd 192.168.1.255 scope global wlan0
+"""
+
+        def fake_execute(*args, **kwargs):
+            if 'route' in args:
+                return response_route, None
+            return response_addr, None
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '192.168.1.137')
+
+    def test_get_my_ipv4_address_with_multi_ipv4_on_single_interface(self):
+        response_route = """
+172.18.56.0/24 dev customer  proto kernel  scope link  src 172.18.56.22
+169.254.0.0/16 dev customer  scope link  metric 1031
+default via 172.18.56.1 dev customer
+"""
+        response_addr = (""
+"31: customer    inet 172.18.56.22/24 brd 172.18.56.255 scope global"
+" customer\n"
+"31: customer    inet 172.18.56.32/24 brd 172.18.56.255 scope global "
+"secondary customer")
+
+        def fake_execute(*args, **kwargs):
+            if 'route' in args:
+                return response_route, None
+            return response_addr, None
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '172.18.56.22')
+
+    def test_get_my_ipv4_address_with_multiple_interfaces(self):
+        response_route = """
+169.1.9.0/24 dev eth1  proto kernel  scope link  src 169.1.9.10
+172.17.248.0/21 dev eth0  proto kernel  scope link  src 172.17.255.9
+169.254.0.0/16 dev eth0  scope link  metric 1002
+169.254.0.0/16 dev eth1  scope link  metric 1003
+default via 172.17.248.1 dev eth0  proto static
+"""
+        response_addr = """
+1: lo    inet 127.0.0.1/8 scope host lo
+2: eth0    inet 172.17.255.9/21 brd 172.17.255.255 scope global eth0
+3: eth1    inet 169.1.9.10/24 scope global eth1
+"""
+
+        def fake_execute(*args, **kwargs):
+            if 'route' in args:
+                return response_route, None
+            return response_addr, None
+
+        self.stubs.Set(utils, 'execute', fake_execute)
+        address = utils.get_my_ipv4_address()
+        self.assertEqual(address, '172.17.255.9')
+
+
 class GenericUtilsTestCase(test.TestCase):
     def test_parse_server_string(self):
         result = utils.parse_server_string('::1')
@@ -357,28 +326,6 @@ class GenericUtilsTestCase(test.TestCase):
     def test_hostname_translate(self):
         hostname = "<}\x1fh\x10e\x08l\x02l\x05o\x12!{>"
         self.assertEqual("hello", utils.sanitize_hostname(hostname))
-
-    def test_bool_from_str(self):
-        self.assertTrue(utils.bool_from_str('1'))
-        self.assertTrue(utils.bool_from_str('2'))
-        self.assertTrue(utils.bool_from_str('-1'))
-        self.assertTrue(utils.bool_from_str('true'))
-        self.assertTrue(utils.bool_from_str('True'))
-        self.assertTrue(utils.bool_from_str('tRuE'))
-        self.assertTrue(utils.bool_from_str('yes'))
-        self.assertTrue(utils.bool_from_str('Yes'))
-        self.assertTrue(utils.bool_from_str('YeS'))
-        self.assertTrue(utils.bool_from_str('y'))
-        self.assertTrue(utils.bool_from_str('Y'))
-        self.assertFalse(utils.bool_from_str('False'))
-        self.assertFalse(utils.bool_from_str('false'))
-        self.assertFalse(utils.bool_from_str('no'))
-        self.assertFalse(utils.bool_from_str('No'))
-        self.assertFalse(utils.bool_from_str('n'))
-        self.assertFalse(utils.bool_from_str('N'))
-        self.assertFalse(utils.bool_from_str('0'))
-        self.assertFalse(utils.bool_from_str(None))
-        self.assertFalse(utils.bool_from_str('junk'))
 
     def test_read_cached_file(self):
         self.mox.StubOutWithMock(os.path, "getmtime")
@@ -429,7 +376,7 @@ class GenericUtilsTestCase(test.TestCase):
     def test_read_file_as_root(self):
         def fake_execute(*args, **kwargs):
             if args[1] == 'bad':
-                raise exception.ProcessExecutionError
+                raise processutils.ProcessExecutionError()
             return 'fakecontents', None
 
         self.stubs.Set(utils, 'execute', fake_execute)
@@ -463,19 +410,6 @@ class GenericUtilsTestCase(test.TestCase):
         h1 = utils.hash_file(flo)
         h2 = hashlib.sha1(data).hexdigest()
         self.assertEquals(h1, h2)
-
-    def test_is_valid_boolstr(self):
-        self.assertTrue(utils.is_valid_boolstr('true'))
-        self.assertTrue(utils.is_valid_boolstr('false'))
-        self.assertTrue(utils.is_valid_boolstr('yes'))
-        self.assertTrue(utils.is_valid_boolstr('no'))
-        self.assertTrue(utils.is_valid_boolstr('y'))
-        self.assertTrue(utils.is_valid_boolstr('n'))
-        self.assertTrue(utils.is_valid_boolstr('1'))
-        self.assertTrue(utils.is_valid_boolstr('0'))
-
-        self.assertFalse(utils.is_valid_boolstr('maybe'))
-        self.assertFalse(utils.is_valid_boolstr('only on tuesdays'))
 
     def test_is_valid_ipv4(self):
         self.assertTrue(utils.is_valid_ipv4('127.0.0.1'))

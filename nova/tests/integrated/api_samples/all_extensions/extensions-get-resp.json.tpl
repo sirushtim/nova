@@ -65,6 +65,14 @@
             "updated": "%(timestamp)s"
         },
         {
+            "alias": "os-extended-volumes",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ExtendedVolumes",
+            "namespace": "http://docs.openstack.org/compute/ext/extended_volumes/api/v1.1",
+            "updated": "%(timestamp)s"
+        },
+        {
             "alias": "OS-EXT-VIF-NET",
             "description": "%(text)s",
             "links": [],
@@ -86,6 +94,14 @@
             "links": [],
             "name": "FlavorExtraData",
             "namespace": "http://docs.openstack.org/compute/ext/flavor_extra_data/api/v1.1",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "OS-SRV-USG",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ServerUsage",
+            "namespace": "http://docs.openstack.org/compute/ext/server_usage/api/v1.1",
             "updated": "%(timestamp)s"
         },
         {
@@ -150,6 +166,14 @@
             "links": [],
             "name": "Cells",
             "namespace": "http://docs.openstack.org/compute/ext/cells/api/v1.1",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-cell-capacities",
+            "description": "%(text)s",
+            "links": [],
+            "name": "CellCapacities",
+            "namespace": "http://docs.openstack.org/compute/ext/cell_capacities/api/v1.1",
             "updated": "%(timestamp)s"
         },
         {
@@ -230,6 +254,14 @@
             "links": [],
             "name": "Evacuate",
             "namespace": "http://docs.openstack.org/compute/ext/evacuate/api/v2",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-extended-floating-ips",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ExtendedFloatingIps",
+            "namespace": "http://docs.openstack.org/compute/ext/extended_floating_ips/api/v2",
             "updated": "%(timestamp)s"
         },
         {
@@ -337,6 +369,14 @@
             "updated": "%(timestamp)s"
         },
         {
+            "alias": "os-extended-services",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ExtendedServices",
+            "namespace": "http://docs.openstack.org/compute/ext/extended_services/api/v2",
+            "updated": "%(timestamp)s"
+        },
+        {
             "alias": "os-fping",
             "description": "%(text)s",
             "links": [],
@@ -406,6 +446,14 @@
             "links": [],
             "name": "QuotaClasses",
             "namespace": "http://docs.openstack.org/compute/ext/quota-classes-sets/api/v1.1",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-extended-quotas",
+            "description": "%(text)s",
+            "links": [],
+            "name": "ExtendedQuotas",
+            "namespace": "http://docs.openstack.org/compute/ext/extended_quotas/api/v1.1",
             "updated": "%(timestamp)s"
         },
         {
@@ -481,6 +529,14 @@
             "updated": "%(timestamp)s"
         },
         {
+            "alias": "os-used-limits-for-admin",
+            "description": "%(text)s",
+            "links": [],
+            "name": "UsedLimitsForAdmin",
+            "namespace": "http://docs.openstack.org/compute/ext/used_limits_for_admin/api/v1.1",
+            "updated": "%(timestamp)s"
+        },
+        {
             "alias": "os-user-data",
             "description": "%(text)s",
             "links": [],
@@ -510,6 +566,14 @@
             "links": [],
             "name": "InstanceActions",
             "namespace": "http://docs.openstack.org/compute/ext/instance-actions/api/v1.1",
+            "updated": "%(timestamp)s"
+        },
+        {
+            "alias": "os-migrations",
+            "description": "%(text)s",
+            "links": [],
+            "name": "Migrations",
+            "namespace": "http://docs.openstack.org/compute/ext/migrations/api/v2.0",
             "updated": "%(timestamp)s"
         }
     ]

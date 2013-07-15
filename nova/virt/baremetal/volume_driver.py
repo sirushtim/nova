@@ -21,9 +21,11 @@ import re
 from oslo.config import cfg
 
 from nova import context as nova_context
+from nova.db import api as nova_db_api
 from nova import exception
 from nova.openstack.common import importutils
 from nova.openstack.common import log as logging
+from nova.openstack.common import processutils
 from nova import utils
 from nova.virt.baremetal import db as bmdb
 from nova.virt.libvirt import utils as libvirt_utils
@@ -91,7 +93,7 @@ def _delete_iscsi_export_tgtadm(tid):
                       '--tid', tid,
                       '--lun', '1',
                       run_as_root=True)
-    except exception.ProcessExecutionError:
+    except processutils.ProcessExecutionError:
         pass
     try:
         utils.execute('tgtadm', '--lld', 'iscsi',
@@ -99,7 +101,7 @@ def _delete_iscsi_export_tgtadm(tid):
                       '--op', 'delete',
                       '--tid', tid,
                       run_as_root=True)
-    except exception.ProcessExecutionError:
+    except processutils.ProcessExecutionError:
         pass
     # Check if the tid is deleted, that is, check the tid no longer exists.
     # If the tid dose not exist, tgtadm returns with exit_code 22.
@@ -113,7 +115,7 @@ def _delete_iscsi_export_tgtadm(tid):
                       '--op', 'show',
                       '--tid', tid,
                       run_as_root=True)
-    except exception.ProcessExecutionError as e:
+    except processutils.ProcessExecutionError as e:
         if e.exit_code == 22:
             # OK, the tid is deleted
             return
@@ -218,10 +220,9 @@ class LibvirtVolumeDriver(VolumeDriver):
         return method(connection_info, *args, **kwargs)
 
     def attach_volume(self, connection_info, instance, mountpoint):
-        node = _get_baremetal_node_by_instance_uuid(instance['uuid'])
         ctx = nova_context.get_admin_context()
-        pxe_ip = bmdb.bm_pxe_ip_get_by_bm_node_id(ctx, node['id'])
-        if not pxe_ip:
+        fixed_ips = nova_db_api.fixed_ip_get_by_instance(ctx, instance['uuid'])
+        if not fixed_ips:
             if not CONF.baremetal.use_unsafe_iscsi:
                 raise exception.NovaException(_(
                     'No fixed PXE IP is associated to %s') % instance['uuid'])
@@ -235,8 +236,9 @@ class LibvirtVolumeDriver(VolumeDriver):
         tid = _get_next_tid()
         _create_iscsi_export_tgtadm(device_path, tid, iqn)
 
-        if pxe_ip:
-            _allow_iscsi_tgtadm(tid, pxe_ip['address'])
+        if fixed_ips:
+            for ip in fixed_ips:
+                _allow_iscsi_tgtadm(tid, ip['address'])
         else:
             # NOTE(NTTdocomo): Since nova-compute does not know the
             # instance's initiator ip, it allows any initiators

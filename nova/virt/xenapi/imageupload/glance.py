@@ -20,6 +20,7 @@ from oslo.config import cfg
 from nova import exception
 from nova.image import glance
 import nova.openstack.common.log as logging
+from nova.virt.xenapi import agent
 from nova.virt.xenapi import vm_utils
 
 LOG = logging.getLogger(__name__)
@@ -44,6 +45,10 @@ class GlanceStore(object):
             'os_type': instance['os_type'] or CONF.default_os_type,
         }
 
+        if agent.USE_AGENT_SM_KEY in instance["system_metadata"]:
+            properties[agent.USE_AGENT_KEY] = \
+                instance["system_metadata"][agent.USE_AGENT_SM_KEY]
+
         for attempt_num in xrange(1, max_attempts + 1):
 
             (glance_host,
@@ -65,7 +70,12 @@ class GlanceStore(object):
                             " ID %(image_id)s"
                             " glance server: %(glance_host)s:%(glance_port)d"
                             " attempt %(attempt_num)d/%(max_attempts)d"),
-                            locals(), instance=instance)
+                          {'vdi_uuids': vdi_uuids,
+                           'image_id': image_id,
+                           'glance_host': glance_host,
+                           'glance_port': glance_port,
+                           'attempt_num': attempt_num,
+                           'max_attempts': max_attempts}, instance=instance)
 
                 return session.call_plugin_serialized('glance',
                                                       'upload_vhd',

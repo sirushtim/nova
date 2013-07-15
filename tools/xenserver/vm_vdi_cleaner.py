@@ -17,12 +17,14 @@
 """vm_vdi_cleaner.py - List or clean orphaned VDIs/instances on XenServer."""
 
 import doctest
+import gettext
 import os
 import sys
 
 from oslo.config import cfg
 import XenAPI
 
+gettext.install('nova', unicode=1)
 
 possible_topdir = os.getcwd()
 if os.path.exists(os.path.join(possible_topdir, "nova", "__init__.py")):
@@ -71,7 +73,7 @@ def find_orphaned_instances(xenapi):
     for vm_ref, vm_rec in _get_applicable_vm_recs(xenapi):
         try:
             uuid = vm_rec['other_config']['nova_uuid']
-            instance = db.api.instance_get_by_uuid(ctxt, uuid)
+            instance = db.instance_get_by_uuid(ctxt, uuid)
         except (KeyError, exception.InstanceNotFound):
             # NOTE(jk0): Err on the side of caution here. If we don't know
             # anything about the particular instance, ignore it.

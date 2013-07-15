@@ -78,7 +78,7 @@ CONF.import_opt('use_forwarded_for', 'nova.api.auth')
 
 def ec2_error(req, request_id, code, message):
     """Helper to send an ec2_compatible error."""
-    LOG.error(_('%(code)s: %(message)s') % locals())
+    LOG.error(_('%(code)s: %(message)s'), {'code': code, 'message': message})
     resp = webob.Response()
     resp.status = 400
     resp.headers['Content-Type'] = 'text/xml'
@@ -158,7 +158,8 @@ class Lockout(wsgi.Middleware):
 
     There is a possible race condition where simultaneous requests could
     sneak in before the lockout hits, but this is extremely rare and would
-    only result in a couple of extra failed attempts."""
+    only result in a couple of extra failed attempts.
+    """
 
     def __init__(self, application):
         """middleware can use fake for testing."""
@@ -180,11 +181,12 @@ class Lockout(wsgi.Middleware):
                 # NOTE(vish): To use incr, failures has to be a string.
                 self.mc.set(failures_key, '1', time=CONF.lockout_window * 60)
             elif failures >= CONF.lockout_attempts:
-                lock_mins = CONF.lockout_minutes
-                msg = _('Access key %(access_key)s has had %(failures)d'
-                        ' failed authentications and will be locked out'
-                        ' for %(lock_mins)d minutes.') % locals()
-                LOG.warn(msg)
+                LOG.warn(_('Access key %(access_key)s has had %(failures)d '
+                           'failed authentications and will be locked out '
+                           'for %(lock_mins)d minutes.'),
+                         {'access_key': access_key,
+                          'failures': failures,
+                          'lock_mins': CONF.lockout_minutes})
                 self.mc.set(failures_key, str(failures),
                             time=CONF.lockout_minutes * 60)
         return res
@@ -250,7 +252,7 @@ class EC2KeystoneAuth(wsgi.Middleware):
             project_name = result['access']['token']['tenant'].get('name')
             roles = [role['name'] for role
                      in result['access']['user']['roles']]
-        except (AttributeError, KeyError), e:
+        except (AttributeError, KeyError) as e:
             LOG.exception(_("Keystone failure: %s") % e)
             msg = _("Failure communicating with keystone")
             return ec2_error(req, request_id, "Unauthorized", msg)
@@ -333,7 +335,8 @@ class Requestify(wsgi.Middleware):
 
         LOG.debug(_('action: %s'), action)
         for key, value in args.items():
-            LOG.debug(_('arg: %(key)s\t\tval: %(value)s') % locals())
+            LOG.debug(_('arg: %(key)s\t\tval: %(value)s'),
+                      {'key': key, 'value': value})
 
         # Success!
         api_request = apirequest.APIRequest(self.controller, action,
@@ -409,7 +412,9 @@ class Authorizer(wsgi.Middleware):
             return self.application
         else:
             LOG.audit(_('Unauthorized request for controller=%(controller)s '
-                        'and action=%(action)s') % locals(), context=context)
+                        'and action=%(action)s'),
+                      {'controller': controller, 'action': action},
+                      context=context)
             raise webob.exc.HTTPUnauthorized()
 
     def _matches_any_role(self, context, roles):
@@ -501,8 +506,6 @@ class Executor(wsgi.Application):
             LOG.info(_('NotFound raised: %s'), unicode(ex), context=context)
             return ec2_error(req, request_id, type(ex).__name__, unicode(ex))
         except exception.EC2APIError as ex:
-            LOG.exception(_('EC2APIError raised: %s'), unicode(ex),
-                          context=context)
             if ex.code:
                 return ec2_error(req, request_id, ex.code, unicode(ex))
             else:

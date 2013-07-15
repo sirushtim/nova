@@ -23,12 +23,16 @@ import random
 
 from oslo.config import cfg
 
-from nova.compute import instance_types
+from nova.compute import flavors
+from nova.compute import rpcapi as compute_rpcapi
+from nova import db
 from nova import exception
 from nova.openstack.common import log as logging
 from nova.openstack.common.notifier import api as notifier
 from nova.scheduler import driver
 from nova.scheduler import scheduler_options
+from nova.scheduler import utils as scheduler_utils
+
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
@@ -54,6 +58,7 @@ class FilterScheduler(driver.Scheduler):
     def __init__(self, *args, **kwargs):
         super(FilterScheduler, self).__init__(*args, **kwargs)
         self.options = scheduler_options.SchedulerOptions()
+        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
 
     def schedule_run_instance(self, context, request_spec,
                               admin_password, injected_files,
@@ -69,13 +74,20 @@ class FilterScheduler(driver.Scheduler):
         notifier.notify(context, notifier.publisher_id("scheduler"),
                         'scheduler.run_instance.start', notifier.INFO, payload)
 
-        instance_uuids = request_spec.pop('instance_uuids')
-        num_instances = len(instance_uuids)
-        LOG.debug(_("Attempting to build %(num_instances)d instance(s)") %
-                locals())
+        instance_uuids = request_spec.get('instance_uuids')
+        LOG.info(_("Attempting to build %(num_instances)d instance(s) "
+                    "uuids: %(instance_uuids)s"),
+                  {'num_instances': len(instance_uuids),
+                   'instance_uuids': instance_uuids})
+        LOG.debug(_("Request Spec: %s") % request_spec)
 
         weighed_hosts = self._schedule(context, request_spec,
-                filter_properties, instance_uuids)
+                                       filter_properties, instance_uuids)
+
+        # NOTE: Pop instance_uuids as individual creates do not need the
+        # set of uuids. Do not pop before here as the upper exception
+        # handler fo NoValidHost needs the uuid to set error state
+        instance_uuids = request_spec.pop('instance_uuids')
 
         # NOTE(comstud): Make sure we do not pass this through.  It
         # contains an instance of RpcContext that cannot be serialized.
@@ -87,6 +99,10 @@ class FilterScheduler(driver.Scheduler):
             try:
                 try:
                     weighed_host = weighed_hosts.pop(0)
+                    LOG.info(_("Choosing host %(weighed_host)s "
+                                "for instance %(instance_uuid)s"),
+                              {'weighed_host': weighed_host,
+                               'instance_uuid': instance_uuid})
                 except IndexError:
                     raise exception.NoValidHost(reason="")
 
@@ -126,7 +142,7 @@ class FilterScheduler(driver.Scheduler):
             raise exception.NoValidHost(reason="")
         weighed_host = weighed_hosts.pop(0)
 
-        self._post_select_populate_filter_properties(filter_properties,
+        scheduler_utils.populate_filter_properties(filter_properties,
                 weighed_host.obj)
 
         # context is not serializable
@@ -146,6 +162,21 @@ class FilterScheduler(driver.Scheduler):
         if not hosts:
             raise exception.NoValidHost(reason="")
         return hosts
+
+    def select_destinations(self, context, request_spec, filter_properties):
+        """Selects a filtered set of hosts and nodes."""
+        num_instances = request_spec['num_instances']
+        instance_uuids = request_spec.get('instance_uuids')
+        selected_hosts = self._schedule(context, request_spec,
+                                        filter_properties, instance_uuids)
+
+        # Couldn't fulfill the request_spec
+        if len(selected_hosts) < num_instances:
+            raise exception.NoValidHost(reason='')
+
+        dests = [dict(host=host.obj.host, nodename=host.obj.nodename,
+                      limists=host.obj.limits) for host in selected_hosts]
+        return dests
 
     def _provision_resource(self, context, weighed_host, request_spec,
             filter_properties, requested_networks, injected_files,
@@ -172,7 +203,7 @@ class FilterScheduler(driver.Scheduler):
         updated_instance = driver.instance_update_db(context,
                 instance_uuid, extra_values=values)
 
-        self._post_select_populate_filter_properties(filter_properties,
+        scheduler_utils.populate_filter_properties(filter_properties,
                 weighed_host.obj)
 
         self.compute_rpcapi.run_instance(context, instance=updated_instance,
@@ -182,31 +213,6 @@ class FilterScheduler(driver.Scheduler):
                 injected_files=injected_files,
                 admin_password=admin_password, is_first_time=is_first_time,
                 node=weighed_host.obj.nodename)
-
-    def _post_select_populate_filter_properties(self, filter_properties,
-            host_state):
-        """Add additional information to the filter properties after a node has
-        been selected by the scheduling process.
-        """
-        # Add a retry entry for the selected compute host and node:
-        self._add_retry_host(filter_properties, host_state.host,
-                             host_state.nodename)
-
-        self._add_oversubscription_policy(filter_properties, host_state)
-
-    def _add_retry_host(self, filter_properties, host, node):
-        """Add a retry entry for the selected compute node. In the event that
-        the request gets re-scheduled, this entry will signal that the given
-        node has already been tried.
-        """
-        retry = filter_properties.get('retry', None)
-        if not retry:
-            return
-        hosts = retry['hosts']
-        hosts.append([host, node])
-
-    def _add_oversubscription_policy(self, filter_properties, host_state):
-        filter_properties['limits'] = host_state.limits
 
     def _get_configuration_options(self):
         """Fetch options dictionary. Broken out for testing."""
@@ -242,9 +248,12 @@ class FilterScheduler(driver.Scheduler):
             return  # no previously attempted hosts, skip
 
         last_host, last_node = hosts[-1]
-        msg = _("Error from last host: %(last_host)s (node %(last_node)s): "
-                "%(exc)s") % locals()
-        LOG.error(msg, instance_uuid=instance_uuid)
+        LOG.error(_('Error from last host: %(last_host)s (node %(last_node)s):'
+                    ' %(exc)s'),
+                  {'last_host': last_host,
+                   'last_node': last_node,
+                   'exc': exc},
+                  instance_uuid=instance_uuid)
 
     def _populate_retry(self, filter_properties, instance_properties):
         """Populate filter properties with history of retries for this
@@ -271,8 +280,10 @@ class FilterScheduler(driver.Scheduler):
         self._log_compute_error(instance_uuid, retry)
 
         if retry['num_attempts'] > max_attempts:
-            msg = _("Exceeded max scheduling attempts %(max_attempts)d for "
-                    "instance %(instance_uuid)s") % locals()
+            msg = (_('Exceeded max scheduling attempts %(max_attempts)d for '
+                     'instance %(instance_uuid)s')
+                   % {'max_attempts': max_attempts,
+                      'instance_uuid': instance_uuid})
             raise exception.NoValidHost(reason=msg)
 
     def _schedule(self, context, request_spec, filter_properties,
@@ -337,10 +348,12 @@ class FilterScheduler(driver.Scheduler):
                 # Can't get any more locally.
                 break
 
-            LOG.debug(_("Filtered %(hosts)s") % locals())
+            LOG.debug(_("Filtered %(hosts)s"), {'hosts': hosts})
 
             weighed_hosts = self.host_manager.get_weighed_hosts(hosts,
                     filter_properties)
+
+            LOG.debug(_("Weighed %(hosts)s"), {'hosts': weighed_hosts})
 
             scheduler_host_subset_size = CONF.scheduler_host_subset_size
             if scheduler_host_subset_size > len(weighed_hosts):
@@ -350,7 +363,6 @@ class FilterScheduler(driver.Scheduler):
 
             chosen_host = random.choice(
                 weighed_hosts[0:scheduler_host_subset_size])
-            LOG.debug(_("Choosing host %(chosen_host)s") % locals())
             selected_hosts.append(chosen_host)
 
             # Now consume the resources so the filter/weights
@@ -359,6 +371,17 @@ class FilterScheduler(driver.Scheduler):
             if update_group_hosts is True:
                 filter_properties['group_hosts'].append(chosen_host.obj.host)
         return selected_hosts
+
+    def _get_compute_info(self, context, dest):
+        """Get compute node's information
+
+        :param context: security context
+        :param dest: hostname (must be compute node)
+        :return: dict of compute node information
+
+        """
+        service_ref = db.service_get_by_compute_host(context, dest)
+        return service_ref['compute_node'][0]
 
     def _assert_compute_node_has_enough_memory(self, context,
                                               instance_ref, dest):
@@ -375,7 +398,7 @@ class FilterScheduler(driver.Scheduler):
         host_state = self.host_manager.host_state_cls(dest, node)
         host_state.update_from_compute_node(compute)
 
-        instance_type = instance_types.extract_instance_type(instance_ref)
+        instance_type = flavors.extract_flavor(instance_ref)
         filter_properties = {'instance_type': instance_type}
 
         hosts = self.host_manager.get_filtered_hosts([host_state],
@@ -383,6 +406,8 @@ class FilterScheduler(driver.Scheduler):
                                                      'RamFilter')
         if not hosts:
             instance_uuid = instance_ref['uuid']
-            reason = _("Unable to migrate %(instance_uuid)s to %(dest)s: "
-                       "Lack of memory")
-            raise exception.MigrationError(reason=reason % locals())
+            reason = (_("Unable to migrate %(instance_uuid)s to %(dest)s: "
+                        "Lack of memory")
+                      % {'instance_uuid': instance_uuid,
+                         'dest': dest})
+            raise exception.MigrationPreCheckError(reason=reason)

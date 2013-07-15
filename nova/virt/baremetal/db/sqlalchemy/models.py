@@ -45,7 +45,6 @@ class BareMetalNode(BASE, models.NovaBase):
     pm_address = Column(Text)
     pm_user = Column(Text)
     pm_password = Column(Text)
-    prov_mac_address = Column(Text)
     task_state = Column(String(255))
     terminal_port = Column(Integer)
     image_path = Column(String(255), nullable=True)
@@ -53,15 +52,6 @@ class BareMetalNode(BASE, models.NovaBase):
     deploy_key = Column(String(255), nullable=True)
     root_mb = Column(Integer)
     swap_mb = Column(Integer)
-
-
-class BareMetalPxeIp(BASE, models.NovaBase):
-    __tablename__ = 'bm_pxe_ips'
-    id = Column(Integer, primary_key=True)
-    deleted = Column(Boolean, default=False)
-    address = Column(String(255), unique=True)
-    server_address = Column(String(255), unique=True)
-    bm_node_id = Column(Integer, ForeignKey('bm_nodes.id'), nullable=True)
 
 
 class BareMetalInterface(BASE, models.NovaBase):

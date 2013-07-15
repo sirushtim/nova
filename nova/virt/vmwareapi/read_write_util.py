@@ -44,8 +44,11 @@ class GlanceFileRead(object):
         self.iter = self.get_next()
 
     def read(self, chunk_size):
-        """Read an item from the queue. The chunk size is ignored for the
-        Client ImageBodyIterator uses its own CHUNKSIZE."""
+        """Read an item from the queue.
+
+        The chunk size is ignored for the Client ImageBodyIterator
+        uses its own CHUNKSIZE.
+        """
         try:
             return self.iter.next()
         except StopIteration:
@@ -97,15 +100,15 @@ class VMwareHTTPFile(object):
 
     def write(self, data):
         """Write data to the file."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def read(self, chunk_size):
         """Read a chunk of data."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
     def get_size(self):
         """Get size of the file to be read."""
-        raise NotImplementedError
+        raise NotImplementedError()
 
 
 class VMwareHTTPWriteFile(VMwareHTTPFile):

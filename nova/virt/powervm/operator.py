@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2012 IBM Corp.
+# Copyright 2013 IBM Corp.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -22,10 +22,9 @@ import time
 from oslo.config import cfg
 
 from nova.compute import power_state
-from nova import exception as nova_exception
 from nova.openstack.common import excutils
 from nova.openstack.common import log as logging
-from nova import utils
+from nova.openstack.common import processutils
 from nova.virt.powervm import blockdev
 from nova.virt.powervm import command
 from nova.virt.powervm import common
@@ -170,6 +169,10 @@ class PowerVMOperator(object):
 
         self._host_stats = data
 
+    def get_host_uptime(self, host):
+        """Returns the result of calling "uptime" on the target host."""
+        return self._operator.get_host_uptime(host)
+
     def spawn(self, context, instance, image_id, network_info):
         def _create_image(context, instance, image_id):
             """Fetch image from glance and copy it to the remote system."""
@@ -199,10 +202,11 @@ class PowerVMOperator(object):
                 #             system (1 in 2^28)
                 self._operator.create_lpar(lpar_inst)
                 LOG.debug(_("Creating LPAR instance '%s'") % instance['name'])
-            except nova_exception.ProcessExecutionError:
+            except processutils.ProcessExecutionError:
                 LOG.exception(_("LPAR instance '%s' creation failed") %
                         instance['name'])
-                raise exception.PowerVMLPARCreationFailed()
+                raise exception.PowerVMLPARCreationFailed(
+                    instance_name=instance['name'])
 
             _create_image(context, instance, image_id)
             LOG.debug(_("Activating the LPAR instance '%s'")
@@ -360,7 +364,7 @@ class PowerVMOperator(object):
         eth_id = self._operator.get_virtual_eth_adapter_id()
         slot_id = int(mac[-2:], 16)
         virtual_eth_adapters = ('%(slot_id)s/0/%(eth_id)s//0/0' %
-                                locals())
+                                {'slot_id': slot_id, 'eth_id': eth_id})
 
         # LPAR configuration data
         # max_virtual_slots is hardcoded to 64 since we generate a MAC
@@ -414,7 +418,8 @@ class PowerVMOperator(object):
         disk_info['root_disk_file'] = dest_file_path
         return disk_info
 
-    def deploy_from_migrated_file(self, lpar, file_path, size):
+    def deploy_from_migrated_file(self, lpar, file_path, size,
+                                  power_on=True):
         """Deploy the logical volume and attach to new lpar.
 
         :param lpar: lar instance
@@ -426,13 +431,14 @@ class PowerVMOperator(object):
         try:
             # deploy lpar from file
             self._deploy_from_vios_file(lpar, file_path, size,
-                                        decompress=need_decompress)
+                                        decompress=need_decompress,
+                                        power_on=power_on)
         finally:
             # cleanup migrated file
             self._operator._remove_file(file_path)
 
     def _deploy_from_vios_file(self, lpar, file_path, size,
-                               decompress=True):
+                               decompress=True, power_on=True):
         self._operator.create_lpar(lpar)
         lpar = self._operator.get_lpar(lpar['name'])
         instance_id = lpar['lpar_id']
@@ -447,7 +453,8 @@ class PowerVMOperator(object):
         self._disk_adapter._copy_file_to_device(file_path, diskName,
                                                 decompress)
 
-        self._operator.start_lpar(lpar['name'])
+        if power_on:
+            self._operator.start_lpar(lpar['name'])
 
 
 class BaseOperator(object):
@@ -464,8 +471,10 @@ class BaseOperator(object):
         self.connection_data = connection
 
     def _set_connection(self):
-        if self._connection is None:
-            self._connection = common.ssh_connect(self.connection_data)
+        # create a new connection or verify an existing connection
+        # and re-establish if the existing connection is dead
+        self._connection = common.check_connection(self._connection,
+                                                   self.connection_data)
 
     def get_lpar(self, instance_name, resource_type='lpar'):
         """Return a LPAR object by its instance name.
@@ -621,6 +630,16 @@ class BaseOperator(object):
         return {'total_mem': int(total_mem),
                 'avail_mem': int(avail_mem)}
 
+    def get_host_uptime(self, host):
+        """
+        Get host uptime.
+        :returns: string - amount of time since last system startup
+        """
+        # The output of the command is like this:
+        # "02:54PM  up 24 days,  5:41, 1 user, load average: 0.06, 0.03, 0.02"
+        cmd = self.command.sysstat('-short %s' % self.connection_data.username)
+        return self.run_vios_command(cmd)[0]
+
     def get_cpu_info(self):
         """Get CPU info.
 
@@ -663,8 +682,15 @@ class BaseOperator(object):
         :param command: String with the command to run.
         """
         self._set_connection()
-        stdout, stderr = utils.ssh_execute(self._connection, cmd,
-                                           check_exit_code=check_exit_code)
+        stdout, stderr = processutils.ssh_execute(
+            self._connection, cmd, check_exit_code=check_exit_code)
+
+        error_text = stderr.strip()
+        if error_text:
+            LOG.debug(_("Found error stream for command \"%(cmd)s\": "
+                        "%(error_text)s"),
+                      {'cmd': cmd, 'error_text': error_text})
+
         return stdout.strip().splitlines()
 
     def run_vios_command_as_root(self, command, check_exit_code=True):
@@ -675,6 +701,13 @@ class BaseOperator(object):
         self._set_connection()
         stdout, stderr = common.ssh_command_as_root(
             self._connection, command, check_exit_code=check_exit_code)
+
+        error_text = stderr.read()
+        if error_text:
+            LOG.debug(_("Found error stream for command \"%(command)s\":"
+                        " %(error_text)s"),
+                      {'command': command, 'error_text': error_text})
+
         return stdout.read().splitlines()
 
     def macs_for_instance(self, instance):
@@ -747,11 +780,11 @@ class BaseOperator(object):
 
     def _decompress_image_file(self, file_path, outfile_path):
         command = "/usr/bin/gunzip -c %s > %s" % (file_path, outfile_path)
-        output = self.run_vios_command_as_root(command)
+        self.run_vios_command_as_root(command)
 
         # Remove compressed image file
         command = "/usr/bin/rm %s" % file_path
-        output = self.run_vios_command_as_root(command)
+        self.run_vios_command_as_root(command)
 
         return outfile_path
 

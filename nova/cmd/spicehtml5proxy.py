@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
 # Copyright (c) 2012 OpenStack Foundation
@@ -29,29 +28,7 @@ from oslo.config import cfg
 from nova import config
 from nova.console import websocketproxy
 
-
 opts = [
-    cfg.BoolOpt('record',
-                default=False,
-                help='Record sessions to FILE.[session_number]'),
-    cfg.BoolOpt('daemon',
-                default=False,
-                help='Become a daemon (background process)'),
-    cfg.BoolOpt('ssl_only',
-                default=False,
-                help='Disallow non-encrypted connections'),
-    cfg.BoolOpt('source_is_ipv6',
-                default=False,
-                help='Source is ipv6'),
-    cfg.StrOpt('cert',
-               default='self.pem',
-               help='SSL certificate file'),
-    cfg.StrOpt('key',
-               default=None,
-               help='SSL key file (if separate from cert)'),
-    cfg.StrOpt('web',
-               default='/usr/share/spice-html5',
-               help='Run webserver on same port. Serve files from DIR.'),
     cfg.StrOpt('spicehtml5proxy_host',
                default='0.0.0.0',
                help='Host on which to listen for incoming requests'),
@@ -62,7 +39,13 @@ opts = [
 
 CONF = cfg.CONF
 CONF.register_cli_opts(opts)
-CONF.import_opt('debug', 'nova.openstack.common.log')
+CONF.import_opt('record', 'nova.cmd.novnc')
+CONF.import_opt('daemon', 'nova.cmd.novnc')
+CONF.import_opt('ssl_only', 'nova.cmd.novnc')
+CONF.import_opt('source_is_ipv6', 'nova.cmd.novnc')
+CONF.import_opt('cert', 'nova.cmd.novnc')
+CONF.import_opt('key', 'nova.cmd.novnc')
+CONF.import_opt('web', 'nova.cmd.novnc')
 
 
 def main():
