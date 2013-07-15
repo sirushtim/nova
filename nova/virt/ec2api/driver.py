@@ -253,15 +253,21 @@ class EC2Driver(driver.ComputeDriver):
 	#elastic_ip = self.conn.allocate_address(domain='vpc')
         private_address = nw_info[0]['network']['subnets'][0]['ips'][0]['address']
 	if instance['user_data'] is not None:
-	    reservation = self.conn.run_instances('ami-3dadcf54',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-05d2256a',user_data = base64.b64decode(instance['user_data']))
+	    reservation = self.conn.run_instances('ami-bd99f0d4',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-05d2256a',user_data = base64.b64decode(instance['user_data']))
 	else:
-	    reservation = self.conn.run_instances('ami-3dadcf54',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-05d2256a')
+	    reservation = self.conn.run_instances('ami-bd99f0d4',key_name='sirus',instance_type='t1.micro',security_group_ids=['sg-a4c105cb'],private_ip_address=private_address,subnet_id='subnet-05d2256a')
         public_instance = reservation.instances[0]        
-        while(public_instance.update()!='running'):
-            time.sleep(10)
-	
-	if public_instance.update() == 'running':
-	    public_instance.add_tag("uuid",instance['uuid'])
+        
+        def _wait_for_boot():
+            """Called at an interval until the VM is running."""
+            if public_instance.update() == 'running':
+                LOG.info(_("Instance spawned successfully."),
+                         instance=instance)
+		public_instance.add_tag("uuid",instance['uuid'])
+                raise utils.LoopingCallDone()
+
+        timer = utils.FixedIntervalLoopingCall(_wait_for_boot)
+        timer.start(interval=0.5).wait()
 
 	#self.conn.associate_address(instance_id = public_instance.id, allocation_id = elastic_ip.allocation_id)
 
@@ -815,7 +821,7 @@ class EC2Driver(driver.ComputeDriver):
                'local_gb_used': 10,
                'hypervisor_type': 'EC2',
                'hypervisor_version': '0.1',
-               'hypervisor_hostname': 'ip-10-0-0-10',
+               'hypervisor_hostname': 'ip-10-0-1-10',
                'cpu_info': 'LOL'}
 
         return dic
